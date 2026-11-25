@@ -113,7 +113,26 @@ fn app_icon() -> Option<egui::IconData> {
     })
 }
 
+/// Markers Claude Code sets for its own session. When the app is started from inside one, a Claude
+/// launched in our terminals would inherit them and run as that session's child (no transcript
+/// saving, nested-session checks). User settings such as `CLAUDE_CODE_USE_BEDROCK` are kept.
+const CLAUDE_SESSION_MARKERS: [&str; 9] = [
+    "CLAUDECODE",
+    "CLAUDE_PID",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_CHILD_NOTES_DIR",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+];
+
 fn main() -> eframe::Result<()> {
+    // Single-threaded here: nothing else reads the environment yet.
+    for key in CLAUDE_SESSION_MARKERS {
+        std::env::remove_var(key);
+    }
     backend::process::install_kill_on_close_guard();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Alethe")

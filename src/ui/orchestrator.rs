@@ -49,6 +49,7 @@ struct Job {
     run_label: Option<String>,
     rules: Option<String>,
     spec: String,
+    cwd: String,
     status: String,
     outcome: Option<String>,
     seconds: Option<f64>,
@@ -553,6 +554,8 @@ type DiffSlot = Arc<Mutex<Option<Result<String, String>>>>;
 
 #[derive(Default)]
 pub struct BoardState {
+    /// The planner tab was picked by hand, so the board stops following live work.
+    pinned: bool,
     revision: u64,
     snapshot: Arc<Snapshot>,
     active: Option<String>,
@@ -678,7 +681,7 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
     let revision = orchestrator.revision();
     if revision != state.revision {
         state.revision = revision;
-        state.snapshot = Arc::new(serde_json::from_value(orchestrator.board()).unwrap_or_default());
+        state.snapshot = Arc::new(parse_snapshot(orchestrator.board()));
     }
     let snapshot = Arc::clone(&state.snapshot);
     // Elapsed clocks tick once a second while something runs; nothing repaints otherwise.
@@ -699,6 +702,43 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
         Stroke::NONE,
         StrokeKind::Inside,
     );
+    // A board shows this project's planners only, and the jobs they delegated; a job with no
+    // planner belongs to the project whose folder it ran in (`OrchestratorPane` jobs filter).
+    let (project_tabs, project_cwd): (HashSet<String>, Option<String>) = app
+        .data
+        .projects
+        .iter()
+        .find(|p| p.terminals.iter().any(|t| t.id == pane_id))
+        .map(|p| {
+            let tabs = p
+                .terminals
+                .iter()
+                .flat_map(|t| t.tabs.iter().map(|tab| tab.id.clone()))
+                .collect();
+            (tabs, p.default_cwd.clone())
+        })
+        .unwrap_or_default();
+    let snapshot = Snapshot {
+        jobs: snapshot
+            .jobs
+            .iter()
+            .filter(|job| match (&job.planner_id, &project_cwd) {
+                (Some(planner), _) => project_tabs.contains(planner),
+                (None, Some(cwd)) => job.cwd.starts_with(cwd.as_str()),
+                (None, None) => true,
+            })
+            .cloned()
+            .collect(),
+        planners: snapshot
+            .planners
+            .iter()
+            .filter(|p| project_tabs.contains(&p.id))
+            .cloned()
+            .collect(),
+        running: snapshot.running,
+        queued: snapshot.queued,
+        concurrency_limit: snapshot.concurrency_limit,
+    };
     let header = Rect::from_min_size(rect.min, vec2(rect.width(), HEADER_H));
     let groups = group_planners(&snapshot);
 
@@ -760,17 +800,20 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
     }
 
     let state = app.boards.get_mut(pane_id).expect("board state");
+    // Until a tab is picked by hand, follow the planner with live work, then any with work.
+    let preferred = || {
+        groups
+            .iter()
+            .find(|g| g.jobs.iter().any(|j| j.can_stop()))
+            .or_else(|| groups.iter().find(|g| !g.jobs.is_empty()))
+            .unwrap_or(&groups[0])
+            .key()
+    };
     let active_key = state
         .active
         .clone()
-        .filter(|k| groups.iter().any(|g| &g.key() == k))
-        .unwrap_or_else(|| {
-            groups
-                .iter()
-                .find(|g| !g.jobs.is_empty())
-                .unwrap_or(&groups[0])
-                .key()
-        });
+        .filter(|k| state.pinned && groups.iter().any(|g| &g.key() == k))
+        .unwrap_or_else(preferred);
     state.active = Some(active_key.clone());
 
     // ---- planner tabs
@@ -839,6 +882,7 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
         );
         if resp.clicked() {
             state.active = Some(group.key());
+            state.pinned = true;
             state.selected = None;
             state.moved = false;
             state.view = None;
@@ -2080,6 +2124,7 @@ fn rail_ui(
                     .clicked()
                     {
                         state.active = Some(g.key());
+                        state.pinned = true;
                         state.selected = None;
                         state.moved = false;
                     }
@@ -2460,4 +2505,872 @@ fn diff_view(ui: &mut egui::Ui, theme: &Theme, diff: &str) {
                 .color(theme.fg_faint),
         );
     }
+}
+
+// ----------------------------------------------------------------- tolerant snapshot parsing
+
+/// Reads the core's snapshot one job at a time, after dropping nulls, so one job with a field
+/// shaped differently than expected costs that job, not the whole board.
+fn parse_snapshot(mut value: serde_json::Value) -> Snapshot {
+    fn strip_nulls(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.retain(|_, v| !v.is_null());
+                map.values_mut().for_each(strip_nulls);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(strip_nulls),
+            _ => {}
+        }
+    }
+    fn list<T: serde::de::DeserializeOwned>(value: &serde_json::Value, key: &str) -> Vec<T> {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| match serde_json::from_value(item.clone()) {
+                        Ok(parsed) => Some(parsed),
+                        Err(error) => {
+                            eprintln!("[orchestrator] skipped a {key} entry: {error}");
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    strip_nulls(&mut value);
+    let count = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize
+    };
+    Snapshot {
+        jobs: list(&value, "jobs"),
+        planners: list(&value, "planners"),
+        running: count("running"),
+        queued: count("queued"),
+        concurrency_limit: count("concurrencyLimit"),
+    }
+}
+
+// ----------------------------------------------------------------- right sidebar: Agents (`AgentsPanel`)
+
+#[derive(Default)]
+pub struct AgentsPanelState {
+    revision: u64,
+    snapshot: Arc<Snapshot>,
+    show_all: bool,
+    scoped_to: Option<String>,
+    collapsed: HashSet<String>,
+    finished_open: HashSet<String>,
+    last_tick: f64,
+    on_planner: bool,
+    prev: Option<(bool, crate::app::RightTab)>,
+}
+
+impl AgentsPanelState {
+    /// A manual tab change wins over the automatic one: focus leaving the planner no longer
+    /// restores the old tab.
+    pub fn forget_auto_open(&mut self) {
+        self.prev = None;
+    }
+}
+
+/// Focusing a planner terminal swaps the right sidebar to Agents; focusing anything else puts back
+/// the tab and visibility from before (`useAgentsSidebarAutoOpen`). Only focus transitions act.
+pub fn auto_open_agents(app: &mut AletheApp) {
+    let on_planner = app.focused_planner().is_some();
+    if on_planner == app.agents_panel.on_planner {
+        return;
+    }
+    app.agents_panel.on_planner = on_planner;
+    if on_planner {
+        app.agents_panel.prev = Some((app.show_right, app.right_tab));
+        app.show_right = true;
+        app.right_tab = crate::app::RightTab::Agents;
+    } else if let Some((visible, tab)) = app.agents_panel.prev.take() {
+        app.show_right = visible;
+        app.right_tab = tab;
+    }
+}
+
+struct PlannerBlock<'a> {
+    key: String,
+    name: String,
+    agent: Option<String>,
+    terminal: Option<(String, String, String)>, // project, terminal, tab
+    active: Vec<&'a Job>,
+    finished: Vec<&'a Job>,
+}
+
+struct ProjectGroup<'a> {
+    key: String,
+    project: Option<(String, String, Color32)>, // id, name, color
+    planners: Vec<PlannerBlock<'a>>,
+    running: usize,
+    waiting: usize,
+    cost: Option<f64>,
+}
+
+fn sum_cost<'a>(jobs: impl Iterator<Item = &'a Job>) -> Option<f64> {
+    jobs.filter_map(|j| j.cost_usd)
+        .fold(None, |acc, c| Some(acc.unwrap_or(0.0) + c))
+}
+
+fn job_title(job: &Job) -> String {
+    job.spec
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+        .or_else(|| clean(job.run_label.as_deref()))
+        .unwrap_or_else(|| job.id.clone())
+}
+
+enum PanelIntent {
+    ToggleProject(String),
+    ToggleFinished(String),
+    ShowAll(bool),
+    Reveal(String, String, String),
+    OpenBoard(String),
+    HidePanel,
+    Stop(String),
+    Answer(String, &'static str),
+    Enable,
+}
+
+pub fn agents_panel(app: &mut AletheApp, ui: &mut egui::Ui) {
+    let theme = app.theme.clone();
+    let lang = app.lang();
+    let t = |key: &str| crate::i18n::tr(lang, key);
+    super::todos::tab_strip(app, ui);
+
+    let enabled = app.feature_enabled("orchestrator");
+    if enabled && !app.orchestrator.is_started() {
+        let _ = app.orchestrator.ensure_started();
+        app.orchestrator
+            .apply_settings(app.data.preferences.extra.get("orchestration"));
+    }
+    let orchestrator = Arc::clone(&app.orchestrator);
+    let planner = app.focused_planner();
+    let now = ui.input(|i| i.time);
+    let state = &mut app.agents_panel;
+    if state.scoped_to != planner {
+        state.scoped_to = planner.clone();
+        state.show_all = false;
+    }
+    let revision = orchestrator.revision();
+    if revision != state.revision {
+        state.revision = revision;
+        state.snapshot = Arc::new(parse_snapshot(orchestrator.board()));
+    }
+    let snapshot = Arc::clone(&state.snapshot);
+    if snapshot.running > 0 {
+        if now - state.last_tick >= 1.0 {
+            state.last_tick = now;
+            orchestrator.refresh();
+        }
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(1000));
+    }
+    let show_all = state.show_all;
+    let scoped = planner.is_some() && !show_all;
+    let jobs: Vec<&Job> = snapshot
+        .jobs
+        .iter()
+        .filter(|j| j.superseded_by.is_none())
+        .filter(|j| !scoped || j.planner_id == planner)
+        .collect();
+
+    // ---- group: project -> planner -> jobs (`groupAgentJobs`)
+    let active_project = match &app.view {
+        crate::app::View::Project(id) => Some(id.clone()),
+        _ => None,
+    };
+    let mut groups: Vec<ProjectGroup> = Vec::new();
+    for job in &jobs {
+        let found = job.planner_id.as_ref().and_then(|pid| {
+            app.data.projects.iter().find_map(|p| {
+                p.terminals.iter().find_map(|term| {
+                    term.tabs.iter().find(|tab| &tab.id == pid).map(|tab| {
+                        let name = term.name.clone();
+                        (p, term.id.clone(), tab.id.clone(), name)
+                    })
+                })
+            })
+        });
+        let project_key = found.as_ref().map(|f| f.0.id.clone()).unwrap_or_default();
+        let gi = match groups.iter().position(|g| g.key == project_key) {
+            Some(i) => i,
+            None => {
+                groups.push(ProjectGroup {
+                    key: project_key.clone(),
+                    project: found.as_ref().map(|f| {
+                        let color =
+                            f.0.color
+                                .as_deref()
+                                .and_then(|c| Color32::from_hex(c).ok())
+                                .unwrap_or(theme.accent);
+                        (f.0.id.clone(), f.0.name.clone(), color)
+                    }),
+                    planners: Vec::new(),
+                    running: 0,
+                    waiting: 0,
+                    cost: None,
+                });
+                groups.len() - 1
+            }
+        };
+        let group = &mut groups[gi];
+        let planner_key = job.planner_id.clone().unwrap_or_default();
+        let bi = match group.planners.iter().position(|b| b.key == planner_key) {
+            Some(i) => i,
+            None => {
+                let declared = snapshot
+                    .planners
+                    .iter()
+                    .find(|p| Some(&p.id) == job.planner_id.as_ref());
+                let name = match (&found, declared, &job.planner_id) {
+                    (Some(f), _, _) => f.3.clone(),
+                    (None, Some(p), _) => {
+                        format!("{} · {}", p.label, t("agentsPanel.plannerClosed"))
+                    }
+                    (None, None, Some(_)) => t("agentsPanel.plannerClosed").to_string(),
+                    _ => t("orchestrator.noPlanner").to_string(),
+                };
+                group.planners.push(PlannerBlock {
+                    key: planner_key,
+                    name,
+                    agent: declared.map(|p| p.agent.clone()).filter(|a| !a.is_empty()),
+                    terminal: found
+                        .as_ref()
+                        .map(|f| (f.0.id.clone(), f.1.clone(), f.2.clone())),
+                    active: Vec::new(),
+                    finished: Vec::new(),
+                });
+                group.planners.len() - 1
+            }
+        };
+        let block = &mut group.planners[bi];
+        if job.can_stop() {
+            block.active.push(job);
+        } else {
+            block.finished.push(job);
+        }
+        match job.status.as_str() {
+            "running" => group.running += 1,
+            "blocked" => group.waiting += 1,
+            _ => {}
+        }
+        if let Some(cost) = job.cost_usd {
+            group.cost = Some(group.cost.unwrap_or(0.0) + cost);
+        }
+    }
+    groups.sort_by_key(|g| {
+        (
+            g.project.is_none(),
+            Some(&g.key) != active_project.as_ref(),
+            g.project.as_ref().map(|p| p.1.to_lowercase()),
+        )
+    });
+
+    let mut intents: Vec<PanelIntent> = Vec::new();
+    let state = &app.agents_panel;
+
+    // ---- header
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(14, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(icons::TYPE_HIERARCHY)
+                        .font(mono(15.0))
+                        .color(theme.fg),
+                );
+                ui.label(
+                    RichText::new(t("agentsPanel.title"))
+                        .font(bold(14.5))
+                        .color(theme.fg),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::icon_button(ui, &theme, icons::LAYOUT_SIDEBAR_RIGHT, "", 24.0)
+                        .clicked()
+                    {
+                        intents.push(PanelIntent::HidePanel);
+                    }
+                    if let Some(project) = &active_project {
+                        if widgets::icon_button(
+                            ui,
+                            &theme,
+                            icons::SCREEN_FULL,
+                            t("agentsPanel.expand"),
+                            24.0,
+                        )
+                        .clicked()
+                        {
+                            intents.push(PanelIntent::OpenBoard(project.clone()));
+                        }
+                    }
+                    if planner.is_some() {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        if ui
+                            .selectable_label(
+                                show_all,
+                                RichText::new(t("agentsPanel.scopeAll")).font(sans(11.5)),
+                            )
+                            .clicked()
+                        {
+                            intents.push(PanelIntent::ShowAll(true));
+                        }
+                        if ui
+                            .selectable_label(
+                                !show_all,
+                                RichText::new(t("agentsPanel.scopeFocused")).font(sans(11.5)),
+                            )
+                            .clicked()
+                        {
+                            intents.push(PanelIntent::ShowAll(false));
+                        }
+                    }
+                });
+            });
+            if !jobs.is_empty() {
+                let count = |s: &str| jobs.iter().filter(|j| j.status == s).count();
+                let (running, waiting, queued) =
+                    (count("running"), count("blocked"), count("queued"));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    let chip = |ui: &mut egui::Ui, text: String, color: Color32| {
+                        ui.label(RichText::new(text).font(mono(11.0)).color(color));
+                    };
+                    if waiting > 0 {
+                        chip(
+                            ui,
+                            fill(t("agentsPanel.waiting"), &[("count", waiting.to_string())]),
+                            theme.waiting,
+                        );
+                    }
+                    if running > 0 {
+                        chip(
+                            ui,
+                            fill(t("orchestrator.running"), &[("count", running.to_string())]),
+                            theme.working,
+                        );
+                    }
+                    if queued > 0 {
+                        chip(
+                            ui,
+                            fill(t("orchestrator.queued"), &[("count", queued.to_string())]),
+                            theme.fg_muted,
+                        );
+                    }
+                    if running + waiting + queued == 0 {
+                        chip(ui, t("agentsPanel.allSettled").to_string(), theme.fg_muted);
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let text = sum_cost(jobs.iter().copied())
+                            .map(fmt_usd)
+                            .unwrap_or_else(|| t("orchestrator.noPrice").to_string());
+                        ui.label(RichText::new(text).font(bold(12.0)).color(theme.fg))
+                            .on_hover_text(t("agentsPanel.costTitle"));
+                    });
+                });
+            }
+        });
+    let y = ui.cursor().top();
+    ui.painter()
+        .hline(ui.max_rect().x_range(), y, Stroke::new(1.0, theme.border));
+
+    // ---- body
+    if !enabled || jobs.is_empty() {
+        ui.add_space(40.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new(icons::TYPE_HIERARCHY)
+                    .font(mono(24.0))
+                    .color(theme.fg_faint),
+            );
+            ui.add_space(6.0);
+            if enabled {
+                ui.label(
+                    RichText::new(t("agentsPanel.emptyTitle"))
+                        .font(bold(13.0))
+                        .color(theme.fg),
+                );
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(t("agentsPanel.emptyBody"))
+                            .font(sans(12.0))
+                            .color(theme.fg_muted),
+                    )
+                    .wrap(),
+                );
+            } else {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(t("orchestrator.disabled"))
+                            .font(sans(12.0))
+                            .color(theme.fg_muted),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(8.0);
+                if widgets::primary_button(ui, &theme, t("settings.orchestrator")).clicked() {
+                    intents.push(PanelIntent::Enable);
+                }
+            }
+        });
+    } else {
+        egui::ScrollArea::vertical()
+            .id_salt("agents-panel")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                for group in &groups {
+                    let collapsed = state.collapsed.contains(&group.key);
+                    project_header(ui, &theme, lang, group, collapsed, &mut intents);
+                    if collapsed {
+                        continue;
+                    }
+                    for block in &group.planners {
+                        planner_header(ui, &theme, block, &mut intents);
+                        for job in &block.active {
+                            agent_job_row(ui, &theme, lang, job, &mut intents);
+                        }
+                        if !block.finished.is_empty() {
+                            let open = state.finished_open.contains(&block.key);
+                            let label = fill(
+                                t("agentsPanel.finished"),
+                                &[("count", block.finished.len().to_string())],
+                            );
+                            let chevron = if open {
+                                icons::CHEVRON_DOWN
+                            } else {
+                                icons::CHEVRON_RIGHT
+                            };
+                            let resp = ui.add(
+                                egui::Button::new(
+                                    RichText::new(format!("{chevron}  {label}"))
+                                        .font(sans(11.5))
+                                        .color(theme.fg_faint),
+                                )
+                                .frame(false),
+                            );
+                            if resp.clicked() {
+                                intents.push(PanelIntent::ToggleFinished(block.key.clone()));
+                            }
+                            if open {
+                                for job in &block.finished {
+                                    agent_job_row(ui, &theme, lang, job, &mut intents);
+                                }
+                            }
+                        }
+                        ui.add_space(6.0);
+                    }
+                }
+            });
+    }
+
+    for intent in intents {
+        match intent {
+            PanelIntent::ToggleProject(key) => {
+                if !app.agents_panel.collapsed.remove(&key) {
+                    app.agents_panel.collapsed.insert(key);
+                }
+            }
+            PanelIntent::ToggleFinished(key) => {
+                if !app.agents_panel.finished_open.remove(&key) {
+                    app.agents_panel.finished_open.insert(key);
+                }
+            }
+            PanelIntent::ShowAll(all) => app.agents_panel.show_all = all,
+            PanelIntent::Reveal(project, terminal, tab) => {
+                app.act(Action::OpenProject(project));
+                app.act(Action::SelectSubTab {
+                    terminal_id: terminal.clone(),
+                    tab_id: tab,
+                });
+                app.act(Action::FocusTerminal(terminal));
+            }
+            PanelIntent::HidePanel => {
+                app.show_right = false;
+                app.agents_panel.forget_auto_open();
+            }
+            PanelIntent::OpenBoard(project) => {
+                let existing = app
+                    .project(&project)
+                    .and_then(|p| {
+                        p.terminals
+                            .iter()
+                            .find(|term| term.kind.as_deref() == Some("orchestrator"))
+                    })
+                    .map(|term| term.id.clone());
+                match existing {
+                    Some(id) => {
+                        app.act(Action::OpenProject(project));
+                        app.act(Action::FocusTerminal(id));
+                    }
+                    None => app.act(Action::NewOrchestration(project)),
+                }
+            }
+            PanelIntent::Stop(job) => orchestrator.cancel(job),
+            PanelIntent::Answer(job, decision) => orchestrator.answer(job, decision),
+            PanelIntent::Enable => app.set_feature("orchestrator", true),
+        }
+    }
+}
+
+fn project_header(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    lang: crate::i18n::Lang,
+    group: &ProjectGroup,
+    collapsed: bool,
+    intents: &mut Vec<PanelIntent>,
+) {
+    let t = |key: &str| crate::i18n::tr(lang, key);
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(r, CornerRadius::same(4), theme.panel_hover);
+    }
+    let mut x = r.left() + 8.0;
+    let chevron = if collapsed {
+        icons::CHEVRON_RIGHT
+    } else {
+        icons::CHEVRON_DOWN
+    };
+    ui.painter().text(
+        pos2(x + 4.0, r.center().y),
+        Align2::CENTER_CENTER,
+        chevron,
+        mono(10.0),
+        theme.fg_faint,
+    );
+    x += 14.0;
+    let (name, color) = match &group.project {
+        Some((_, name, color)) => (name.clone(), *color),
+        None => (t("agentsPanel.noProject").to_string(), theme.fg_faint),
+    };
+    let badge = Rect::from_min_size(pos2(x, r.center().y - 8.0), Vec2::splat(16.0));
+    ui.painter()
+        .rect_filled(badge, CornerRadius::same(4), color.gamma_multiply(0.85));
+    let initial = name
+        .chars()
+        .next()
+        .unwrap_or('?')
+        .to_uppercase()
+        .to_string();
+    ui.painter().text(
+        badge.center(),
+        Align2::CENTER_CENTER,
+        initial,
+        bold(10.0),
+        Color32::WHITE,
+    );
+    x += 22.0;
+    // Right side, right to left: open board, cost, running, waiting.
+    let mut right = r.right() - 6.0;
+    if let Some((project_id, _, _)) = &group.project {
+        let b = Rect::from_center_size(pos2(right - 10.0, r.center().y), Vec2::splat(20.0));
+        let br = ui.interact(
+            b,
+            ui.scope_id().with(("agents-board", project_id)),
+            Sense::click(),
+        );
+        if br.hovered() {
+            ui.painter()
+                .rect_filled(b, CornerRadius::same(4), theme.panel);
+        }
+        ui.painter().text(
+            b.center(),
+            Align2::CENTER_CENTER,
+            icons::SCREEN_FULL,
+            mono(11.0),
+            theme.fg_muted,
+        );
+        if br.on_hover_text(t("agentsPanel.openBoard")).clicked() {
+            intents.push(PanelIntent::OpenBoard(project_id.clone()));
+        }
+        right -= 26.0;
+    }
+    let p = ui.painter();
+    let put = |text: String, color: Color32, right: &mut f32| {
+        let g = p.layout_no_wrap(text, mono(11.0), color);
+        *right -= g.size().x;
+        p.galley(pos2(*right, r.center().y - g.size().y / 2.0), g, color);
+        *right -= 8.0;
+    };
+    if let Some(cost) = group.cost {
+        put(fmt_usd(cost), theme.fg_muted, &mut right);
+    }
+    if group.running > 0 {
+        put(group.running.to_string(), theme.working, &mut right);
+        p.circle_filled(pos2(right - 1.0, r.center().y), 3.0, theme.working);
+        right -= 12.0;
+    }
+    if group.waiting > 0 {
+        put(group.waiting.to_string(), theme.waiting, &mut right);
+    }
+    p.with_clip_rect(Rect::from_min_max(
+        pos2(x, r.top()),
+        pos2(right, r.bottom()),
+    ))
+    .text(
+        pos2(x, r.center().y),
+        Align2::LEFT_CENTER,
+        name,
+        bold(12.5),
+        theme.fg,
+    );
+    if resp.clicked() {
+        intents.push(PanelIntent::ToggleProject(group.key.clone()));
+    }
+}
+
+fn planner_header(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    block: &PlannerBlock,
+    intents: &mut Vec<PanelIntent>,
+) {
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
+    let can_reveal = block.terminal.is_some();
+    if can_reveal && resp.hovered() {
+        ui.painter()
+            .rect_filled(r, CornerRadius::same(4), theme.panel_hover);
+    }
+    let icon = Rect::from_min_size(pos2(r.left() + 20.0, r.center().y - 6.5), Vec2::splat(13.0));
+    agent_glyph(ui, theme, block.agent.as_deref(), icon);
+    let total = (block.active.len() + block.finished.len()).to_string();
+    let p = ui.painter();
+    p.text(
+        pos2(r.right() - 8.0, r.center().y),
+        Align2::RIGHT_CENTER,
+        &total,
+        mono(10.5),
+        theme.fg_faint,
+    );
+    p.with_clip_rect(Rect::from_min_max(
+        pos2(icon.right() + 7.0, r.top()),
+        pos2(r.right() - 30.0, r.bottom()),
+    ))
+    .text(
+        pos2(icon.right() + 7.0, r.center().y),
+        Align2::LEFT_CENTER,
+        &block.name,
+        sans(12.0),
+        if can_reveal { theme.fg } else { theme.fg_muted },
+    );
+    if resp.clicked() {
+        if let Some((project, terminal, tab)) = &block.terminal {
+            intents.push(PanelIntent::Reveal(
+                project.clone(),
+                terminal.clone(),
+                tab.clone(),
+            ));
+        }
+    }
+}
+
+fn agent_job_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    lang: crate::i18n::Lang,
+    job: &Job,
+    intents: &mut Vec<PanelIntent>,
+) {
+    let t = |key: &str| crate::i18n::tr(lang, key);
+    let lane = job.lane();
+    let ask = job
+        .pending_approval
+        .as_ref()
+        .filter(|_| job.status == "blocked");
+    let height = 40.0 + if ask.is_some() { 64.0 } else { 0.0 };
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(r, CornerRadius::same(5), theme.panel_hover);
+    }
+    let left = r.left() + 26.0;
+    let top = r.top() + 5.0;
+    let dot_at = pos2(left + 4.0, top + 8.0);
+    if lane == Lane::Running {
+        let phase = (ui.input(|i| i.time) as f32 * 3.0).sin() * 0.5 + 0.5;
+        ui.painter()
+            .circle_filled(dot_at, 3.0 + phase * 2.0, theme.working.gamma_multiply(0.3));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(120));
+    }
+    dot(ui.painter(), dot_at, 1.0, lane, theme);
+    let icon = Rect::from_min_size(pos2(left + 13.0, top + 1.0), Vec2::splat(14.0));
+    agent_glyph(ui, theme, Some(&job.agent), icon);
+    let text_left = icon.right() + 7.0;
+    let mut right = r.right() - 6.0;
+    if job.can_stop() {
+        let b = Rect::from_center_size(pos2(right - 9.0, top + 8.0), Vec2::splat(18.0));
+        let br = ui.interact(
+            b,
+            ui.scope_id().with(("agents-stop", &job.id)),
+            Sense::click(),
+        );
+        if br.hovered() {
+            ui.painter()
+                .rect_filled(b, CornerRadius::same(4), theme.panel);
+        }
+        ui.painter().text(
+            b.center(),
+            Align2::CENTER_CENTER,
+            icons::DEBUG_STOP,
+            mono(11.0),
+            theme.fg_muted,
+        );
+        if br.on_hover_text(t("orchestrator.menuStop")).clicked() {
+            intents.push(PanelIntent::Stop(job.id.clone()));
+        }
+        right -= 24.0;
+    }
+    let p = ui.painter();
+    if let Some(elapsed) = format_elapsed(job.seconds) {
+        let g = p.layout_no_wrap(elapsed, mono(10.5), theme.fg_faint);
+        right -= g.size().x;
+        p.galley(pos2(right, top + 8.0 - g.size().y / 2.0), g, theme.fg_faint);
+        right -= 8.0;
+    }
+    p.with_clip_rect(Rect::from_min_max(
+        pos2(text_left, r.top()),
+        pos2(right, r.bottom()),
+    ))
+    .text(
+        pos2(text_left, top + 8.0),
+        Align2::LEFT_CENTER,
+        job_title(job),
+        sans(12.5),
+        theme.fg,
+    );
+
+    // Meta: model · effort · role, status (when not running), cost (or tokens until it is known).
+    let meta_y = top + 25.0;
+    let mut meta_right = r.right() - 6.0;
+    let put = |text: String, color: Color32, right: &mut f32| {
+        let g = p.layout_no_wrap(text, mono(10.5), color);
+        *right -= g.size().x;
+        p.galley(pos2(*right, meta_y - g.size().y / 2.0), g, color);
+        *right -= 8.0;
+    };
+    if let Some(cost) = job
+        .cost_usd
+        .map(fmt_usd)
+        .or_else(|| format_tokens(job.total_tokens()))
+    {
+        put(cost, theme.fg_muted, &mut meta_right);
+    }
+    if lane != Lane::Running {
+        let color = match lane {
+            Lane::Finished => theme.fg_faint,
+            lane => lane.color(theme),
+        };
+        put(
+            t(&format!("orchestrator.status.{}", job.status)).to_string(),
+            color,
+            &mut meta_right,
+        );
+    }
+    let details: Vec<String> = [job.model.clone(), job.effort.clone(), job.role.clone()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if !details.is_empty() {
+        p.with_clip_rect(Rect::from_min_max(
+            pos2(text_left, r.top()),
+            pos2(meta_right, r.bottom()),
+        ))
+        .text(
+            pos2(text_left, meta_y),
+            Align2::LEFT_CENTER,
+            details.join(" · "),
+            mono(10.5),
+            theme.fg_faint,
+        );
+    }
+
+    if let Some(ask) = ask {
+        let block = Rect::from_min_max(
+            pos2(text_left - 4.0, r.top() + 38.0),
+            pos2(r.right() - 6.0, r.bottom() - 4.0),
+        );
+        p.rect_filled(
+            block,
+            CornerRadius::same(5),
+            blend(theme.waiting, theme.bg, 0.12),
+        );
+        let question = if ask.kind == "fileChange" {
+            t("orchestrator.askFileChange")
+        } else {
+            t("orchestrator.askCommand")
+        };
+        p.text(
+            pos2(block.left() + 6.0, block.top() + 10.0),
+            Align2::LEFT_CENTER,
+            question,
+            sans(11.5),
+            theme.waiting,
+        );
+        if let Some(command) = ask.command.as_ref().or(ask.reason.as_ref()) {
+            p.with_clip_rect(block.shrink(4.0)).text(
+                pos2(block.left() + 6.0, block.top() + 26.0),
+                Align2::LEFT_CENTER,
+                command,
+                mono(10.5),
+                theme.fg,
+            );
+        }
+        let buttons: [(&str, &'static str); 2] = [
+            ("orchestrator.answerAccept", "accept"),
+            ("orchestrator.answerDecline", "decline"),
+        ];
+        let bw = 84.0;
+        for (i, (label, decision)) in buttons.iter().enumerate() {
+            let b = Rect::from_min_size(
+                pos2(
+                    block.left() + 6.0 + i as f32 * (bw + 6.0),
+                    block.bottom() - 22.0,
+                ),
+                vec2(bw, 18.0),
+            );
+            let br = ui.interact(
+                b,
+                ui.scope_id().with(("agents-answer", &job.id, i)),
+                Sense::click(),
+            );
+            let primary = i == 0;
+            ui.painter().rect(
+                b,
+                CornerRadius::same(4),
+                if primary {
+                    theme.accent
+                } else if br.hovered() {
+                    theme.panel_hover
+                } else {
+                    theme.panel
+                },
+                Stroke::new(1.0, theme.border),
+                StrokeKind::Inside,
+            );
+            ui.painter().text(
+                b.center(),
+                Align2::CENTER_CENTER,
+                t(label),
+                sans(11.0),
+                if primary { theme.accent_on } else { theme.fg },
+            );
+            if br.clicked() {
+                intents.push(PanelIntent::Answer(job.id.clone(), decision));
+            }
+        }
+    }
+    resp.on_hover_text(&job.spec);
 }

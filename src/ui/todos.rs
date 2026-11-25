@@ -2,45 +2,71 @@
 
 use super::icons;
 use super::widgets::{self, mono, sans};
-use crate::app::{Action, AletheApp};
+use crate::app::{Action, AletheApp, RightTab};
 use egui::{
     Align, Align2, CornerRadius, Layout, Margin, Pos2, RichText, Sense, Stroke, StrokeKind, Vec2,
 };
+
+/// Todo | Agents switcher at the top of the right sidebar.
+pub fn tab_strip(app: &mut AletheApp, ui: &mut egui::Ui) {
+    let theme = app.theme.clone();
+    let tabs = [
+        (RightTab::Todos, icons::CHECKLIST, app.t("todo.tab")),
+        (
+            RightTab::Agents,
+            icons::TYPE_HIERARCHY,
+            app.t("agentsPanel.title"),
+        ),
+    ];
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (tab, glyph, label) in tabs {
+                    let active = app.right_tab == tab;
+                    let text = format!("{glyph}  {label}");
+                    let width = ui.fonts_mut(|f| {
+                        f.layout_no_wrap(text.clone(), widgets::bold(12.5), theme.fg)
+                            .size()
+                            .x
+                    }) + 24.0;
+                    let (r, resp) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
+                    if active {
+                        ui.painter().rect(
+                            r,
+                            CornerRadius::same(6),
+                            theme.panel,
+                            Stroke::new(1.0, theme.border_strong),
+                            StrokeKind::Inside,
+                        );
+                    } else if resp.hovered() {
+                        ui.painter()
+                            .rect_filled(r, CornerRadius::same(6), theme.panel_hover);
+                    }
+                    ui.painter().text(
+                        r.center(),
+                        Align2::CENTER_CENTER,
+                        text,
+                        widgets::bold(12.5),
+                        if active { theme.fg } else { theme.fg_muted },
+                    );
+                    if resp.clicked() {
+                        app.right_tab = tab;
+                        app.agents_panel.forget_auto_open();
+                    }
+                }
+            });
+        });
+    rule(ui, &theme);
+}
 
 pub fn show(app: &mut AletheApp, ui: &mut egui::Ui) {
     let theme = app.theme.clone();
     let lang = app.lang();
     let width = ui.available_width();
 
-    egui::Frame::new()
-        .inner_margin(Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let (r, _) = ui.allocate_exact_size(Vec2::new(78.0, 30.0), Sense::hover());
-                ui.painter().rect(
-                    r,
-                    CornerRadius::same(6),
-                    theme.panel,
-                    Stroke::new(1.0, theme.border_strong),
-                    StrokeKind::Inside,
-                );
-                ui.painter().text(
-                    r.center(),
-                    Align2::CENTER_CENTER,
-                    format!("{}  {}", icons::CHECKLIST, app.t("todo.tab")),
-                    widgets::bold(12.5),
-                    theme.fg,
-                );
-                ui.add_enabled_ui(false, |ui| {
-                    ui.label(
-                        RichText::new(format!("{}  Markdown", icons::MARKDOWN))
-                            .font(widgets::bold(12.5))
-                            .color(theme.fg_faint),
-                    );
-                });
-            });
-        });
-    rule(ui, &theme);
+    tab_strip(app, ui);
 
     let open = app.data.todos.iter().filter(|t| !t.completed).count();
     egui::Frame::new()

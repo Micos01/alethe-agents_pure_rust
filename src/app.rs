@@ -21,6 +21,13 @@ pub enum View {
     Project(String),
 }
 
+/// Which panel the right sidebar shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RightTab {
+    Todos,
+    Agents,
+}
+
 /// Which panel the left sidebar shows below its switcher.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidebarTab {
@@ -166,6 +173,10 @@ pub struct AletheApp {
     pub maximized: Option<String>,
     pub show_sidebar: bool,
     pub show_right: bool,
+    pub right_tab: RightTab,
+    /// Sub-tab ids whose agent was launched with the orchestrator tools (a job's `plannerId`).
+    pub planner_tabs: std::collections::HashSet<String>,
+    pub agents_panel: crate::ui::orchestrator::AgentsPanelState,
     pub sidebar_search: String,
     pub sidebar_tab: SidebarTab,
     pub git_panel: crate::ui::git_panel::GitPanel,
@@ -271,7 +282,15 @@ impl AletheApp {
             focus_request: None,
             maximized: None,
             show_sidebar: true,
-            show_right: false,
+            // `ALETHE_NATIVE_SMOKE=@agents` opens with the Agents panel showing.
+            show_right: std::env::var("ALETHE_NATIVE_SMOKE").as_deref() == Ok("@agents"),
+            right_tab: if std::env::var("ALETHE_NATIVE_SMOKE").as_deref() == Ok("@agents") {
+                RightTab::Agents
+            } else {
+                RightTab::Todos
+            },
+            planner_tabs: Default::default(),
+            agents_panel: Default::default(),
             sidebar_search: String::new(),
             // `ALETHE_NATIVE_SMOKE=@git` opens on the Source Control tab.
             sidebar_tab: if std::env::var("ALETHE_NATIVE_SMOKE").as_deref() == Ok("@git") {
@@ -344,6 +363,23 @@ impl AletheApp {
         self.dirty_since.get_or_insert_with(Instant::now);
     }
 
+    /// The focused terminal's active sub-tab id, when that tab is an orchestrator planner.
+    pub fn focused_planner(&self) -> Option<String> {
+        let focused = self.focused_terminal.as_ref()?;
+        let terminal = self
+            .data
+            .projects
+            .iter()
+            .flat_map(|p| p.terminals.iter())
+            .find(|t| &t.id == focused)?;
+        let tab = terminal
+            .tabs
+            .iter()
+            .find(|tab| tab.id == terminal.active_tab_id)
+            .or_else(|| terminal.tabs.first())?;
+        self.planner_tabs.contains(&tab.id).then(|| tab.id.clone())
+    }
+
     pub fn project(&self, id: &str) -> Option<&Project> {
         self.data.projects.iter().find(|p| p.id == id)
     }
@@ -414,10 +450,13 @@ impl AletheApp {
         }
 
         let (project, index) = self.find_terminal_mut(terminal_id)?;
+        let project_name = project.name.clone();
         let terminal = &mut project.terminals[index];
         terminal.last_used_at = Some(now_ms());
         let terminal_cwd = terminal.cwd.clone();
-        let terminal_name = terminal.name.clone();
+        // Planner tabs on the board read "project · terminal": every Claude terminal is named
+        // "Claude Code" otherwise.
+        let terminal_name = format!("{project_name} · {}", terminal.name);
         let tab = terminal.active_tab_mut()?;
 
         let info = crate::agents::info(&tab.agent);
@@ -459,6 +498,7 @@ impl AletheApp {
             if agent == "claude" {
                 match self.orchestrator.claude_config(&planner) {
                     Ok(path) => {
+                        self.planner_tabs.insert(tab_id.clone());
                         let mut with_mcp = vec![
                             "--mcp-config".to_string(),
                             path.to_string_lossy().to_string(),
@@ -470,7 +510,10 @@ impl AletheApp {
                 }
             } else {
                 match self.orchestrator.codex_config(&planner, &cwd) {
-                    Ok(()) => planner_env = Some(tab_id.clone()),
+                    Ok(()) => {
+                        self.planner_tabs.insert(tab_id.clone());
+                        planner_env = Some(tab_id.clone());
+                    }
                     Err(error) => eprintln!("[orchestrator] {error}"),
                 }
             }

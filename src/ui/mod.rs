@@ -45,6 +45,7 @@ pub fn root(app: &mut AletheApp, ui: &mut egui::Ui) {
             .show(ui, |ui| sidebar::show(app, ui));
     }
 
+    orchestrator::auto_open_agents(app);
     if app.show_right {
         egui::Panel::right("right-sidebar")
             .resizable(true)
@@ -55,7 +56,10 @@ pub fn root(app: &mut AletheApp, ui: &mut egui::Ui) {
                     .fill(theme.bg)
                     .stroke(Stroke::new(1.0, theme.border)),
             )
-            .show(ui, |ui| todos::show(app, ui));
+            .show(ui, |ui| match app.right_tab {
+                crate::app::RightTab::Todos => todos::show(app, ui),
+                crate::app::RightTab::Agents => orchestrator::agents_panel(app, ui),
+            });
     }
 
     egui::CentralPanel::default()
