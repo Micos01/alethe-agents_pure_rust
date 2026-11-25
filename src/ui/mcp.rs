@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use super::icons;
 use super::widgets::{self, mono, sans};
 use crate::app::AletheApp;
+use crate::backend::mcp_health::{McpHealth, McpHealthStatus};
 use crate::backend::mcp_model::{
     McpAgent, McpAgentSnapshot, McpScope, McpServerRecordView, McpTransportView, ALL_MCP_AGENTS,
 };
@@ -20,6 +21,7 @@ use egui::{
 };
 
 type Pending = Arc<Mutex<Option<Vec<McpAgentSnapshot>>>>;
+type HealthResult = Result<Vec<McpHealth>, String>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum Transport {
@@ -58,6 +60,17 @@ pub struct McpPanelState {
     /// Showing installed skills instead of servers.
     show_skills: bool,
     pub skills: super::skills::SkillsState,
+    /// Last `<cli> mcp list` result per agent, and the one running now.
+    health: Vec<(McpAgent, HealthResult)>,
+    checking: Option<(McpAgent, Arc<Mutex<Option<HealthResult>>>)>,
+}
+
+/// The agents whose CLI can report server status (`MCP_HEALTH_AGENTS`).
+fn health_capable(agent: McpAgent) -> bool {
+    matches!(
+        agent,
+        McpAgent::Claude | McpAgent::Codex | McpAgent::Opencode
+    )
 }
 
 /// One server name across agents (`groupServersByName`).
@@ -177,6 +190,29 @@ impl McpPanelState {
         }
     }
 
+    fn start_health(&mut self, agent: McpAgent, ctx: &egui::Context) {
+        let slot: Arc<Mutex<Option<HealthResult>>> = Arc::default();
+        let out = Arc::clone(&slot);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            *out.lock().unwrap() = Some(crate::backend::mcp_health::mcp_health_check(agent));
+            ctx.request_repaint();
+        });
+        self.checking = Some((agent, slot));
+    }
+
+    fn poll_health(&mut self) {
+        let done = self
+            .checking
+            .as_ref()
+            .and_then(|(agent, slot)| slot.lock().unwrap().take().map(|r| (*agent, r)));
+        if let Some((agent, result)) = done {
+            self.health.retain(|(a, _)| *a != agent);
+            self.health.push((agent, result));
+            self.checking = None;
+        }
+    }
+
     fn report<T>(&mut self, result: Result<T, String>, ok: String) {
         self.message = Some(match result {
             Ok(_) => (ok, false),
@@ -197,6 +233,8 @@ pub fn panel(app: &mut AletheApp, ui: &mut egui::Ui) {
     if state.scope.is_none() {
         state.scope = Some(scope_pref);
         state.show_skills = std::env::var("ALETHE_NATIVE_SMOKE").as_deref() == Ok("@skills");
+        // `ALETHE_NATIVE_SMOKE_MCP=<server>` opens with that server's detail showing.
+        state.selected = std::env::var("ALETHE_NATIVE_SMOKE_MCP").ok();
     }
     if !state.loaded && state.pending.is_none() || state.repo != repo {
         state.repo = repo.clone();
@@ -226,6 +264,7 @@ pub fn panel(app: &mut AletheApp, ui: &mut egui::Ui) {
                         app.mcp_panel.show_skills = skills;
                     }
                 }
+                ui.add_space(8.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if widgets::icon_button(ui, &theme, icons::LAYOUT_SIDEBAR_RIGHT, "", 24.0)
                         .clicked()
@@ -304,7 +343,10 @@ pub fn panel(app: &mut AletheApp, ui: &mut egui::Ui) {
             detail(app, ui, group, scope);
             return;
         }
-        app.mcp_panel.selected = None;
+        // Only once a scan has settled: a server just added isn't in the old list yet.
+        if app.mcp_panel.loaded && app.mcp_panel.pending.is_none() {
+            app.mcp_panel.selected = None;
+        }
     }
 
     // ---- search + agent filter
@@ -593,8 +635,10 @@ fn detail(app: &mut AletheApp, ui: &mut egui::Ui, group: &ServerGroup, scope: Mc
     let lang = app.lang();
     let t = |key: &str| crate::i18n::tr(lang, key);
     let repo = app.mcp_panel.repo.clone();
+    app.mcp_panel.poll_health();
     let mut back = false;
     let mut changed = false;
+    let mut check: Option<McpAgent> = None;
     egui::ScrollArea::vertical()
         .id_salt("mcp-detail")
         .auto_shrink([false, false])
@@ -661,6 +705,71 @@ fn detail(app: &mut AletheApp, ui: &mut egui::Ui, group: &ServerGroup, scope: Mc
                                     .color(theme.fg_faint),
                             )
                             .on_hover_text(&record.source_path);
+                            let probed = app
+                                .mcp_panel
+                                .health
+                                .iter()
+                                .find(|(a, _)| *a == record.agent)
+                                .map(|(_, r)| r);
+                            match probed {
+                                Some(Ok(list)) => {
+                                    let status = list
+                                        .iter()
+                                        .find(|h| h.name == group.name)
+                                        .map(|h| h.status);
+                                    let (key, color) = match status {
+                                        Some(McpHealthStatus::Connected) => {
+                                            ("mcp.health.connected", theme.working)
+                                        }
+                                        Some(McpHealthStatus::Failed) => {
+                                            ("mcp.health.failed", theme.offline)
+                                        }
+                                        Some(McpHealthStatus::NeedsAuth) => {
+                                            ("mcp.health.needsAuth", theme.waiting)
+                                        }
+                                        Some(McpHealthStatus::Disabled) => {
+                                            ("mcp.health.disabled", theme.fg_faint)
+                                        }
+                                        Some(McpHealthStatus::Unknown) => {
+                                            ("mcp.health.unknown", theme.fg_faint)
+                                        }
+                                        None => ("mcp.health.absent", theme.fg_faint),
+                                    };
+                                    ui.label(RichText::new(t(key)).font(mono(10.5)).color(color));
+                                }
+                                Some(Err(error)) => {
+                                    let key = format!("mcp.healthError.{error}");
+                                    let text = crate::i18n::tr(lang, &key);
+                                    ui.label(
+                                        RichText::new(if text == key {
+                                            error.as_str()
+                                        } else {
+                                            text
+                                        })
+                                        .font(mono(10.5))
+                                        .color(theme.offline),
+                                    );
+                                }
+                                None => {}
+                            }
+                            if health_capable(record.agent) {
+                                let running = app.mcp_panel.checking.as_ref().map(|(a, _)| *a);
+                                if running == Some(record.agent) {
+                                    ui.add(egui::Spinner::new().size(11.0));
+                                } else if ui
+                                    .add_enabled(
+                                        running.is_none(),
+                                        egui::Button::new(
+                                            RichText::new(t("mcp.healthCheck")).font(sans(11.0)),
+                                        )
+                                        .small(),
+                                    )
+                                    .on_hover_text(t("mcp.healthCheckHint"))
+                                    .clicked()
+                                {
+                                    check = Some(record.agent);
+                                }
+                            }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if widgets::icon_button(
                                     ui,
@@ -758,6 +867,9 @@ fn detail(app: &mut AletheApp, ui: &mut egui::Ui, group: &ServerGroup, scope: Mc
     }
     if changed {
         app.mcp_panel.rescan(ui.ctx());
+    }
+    if let Some(agent) = check {
+        app.mcp_panel.start_health(agent, ui.ctx());
     }
 }
 

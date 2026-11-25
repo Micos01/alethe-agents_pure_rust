@@ -22,3 +22,5 @@ pub mod mcp_support;
 #[rustfmt::skip]
 #[allow(dead_code)] // the bundled-skill catalog is not wired to the UI yet
 pub mod skills;
+#[rustfmt::skip]
+pub mod mcp_health;
