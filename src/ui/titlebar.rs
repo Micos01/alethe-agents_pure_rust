@@ -139,6 +139,7 @@ pub fn show(app: &mut AletheApp, ui: &mut egui::Ui) {
             }
             pomodoro_pill(app, ui);
             usage_pills(app, ui);
+            cost_hud(app, ui);
             let mb = app.memory_mb.load(Ordering::Relaxed);
             pill(ui, &theme, &format!("{mb} MB"), None);
             let profile = app.storage.index.active_name();
@@ -593,4 +594,100 @@ fn usage_pills(app: &mut AletheApp, ui: &mut egui::Ui) {
             app.usage.refresh();
         }
     }
+}
+
+/// `TokenHud`: the running Claude sessions' total cost, one row per terminal on hover.
+fn cost_hud(app: &mut AletheApp, ui: &mut egui::Ui) {
+    let rows = app.transcripts.all();
+    if rows.is_empty() {
+        return;
+    }
+    let theme = app.theme.clone();
+    let total: f64 = rows.iter().filter_map(|(_, s)| s.cost_usd).sum();
+    let priced = rows.iter().any(|(_, s)| s.cost_usd.is_some());
+    let color = super::workspace::cost_color(&theme, priced.then_some(total));
+    let label = if priced {
+        crate::transcripts::fmt_usd(total)
+    } else {
+        crate::transcripts::fmt_tokens(rows.iter().map(|(_, s)| s.total_tokens).sum())
+    };
+    let galley = ui.painter().layout_no_wrap(label, mono(11.5), color);
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(galley.size().x + 16.0, 24.0), Sense::hover());
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(6),
+        if response.hovered() {
+            theme.panel_hover
+        } else {
+            theme.bg
+        },
+        Stroke::new(1.0, theme.border),
+        StrokeKind::Inside,
+    );
+    ui.painter().galley(
+        Pos2::new(rect.left() + 8.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    response.on_hover_ui(|ui| {
+        ui.set_min_width(240.0);
+        ui.label(
+            RichText::new(app.t("hud.title"))
+                .font(widgets::bold(12.5))
+                .color(theme.fg),
+        );
+        for (tab_id, stats) in &rows {
+            let place = std::path::Path::new(&stats.cwd)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| stats.cwd.clone());
+            let title = app
+                .find_tab(tab_id)
+                .map(|tab| app.tab_title(tab))
+                .unwrap_or_default();
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.label(RichText::new(&title).font(sans(12.0)).color(theme.fg));
+                    ui.label(
+                        RichText::new(format!(
+                            "{place} · {} · {} {}",
+                            stats.model.as_deref().unwrap_or("claude"),
+                            crate::transcripts::fmt_tokens(stats.total_tokens),
+                            app.t("hud.tokens")
+                        ))
+                        .font(mono(10.5))
+                        .color(theme.fg_faint),
+                    );
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let text = stats
+                        .cost_usd
+                        .map(crate::transcripts::fmt_usd)
+                        .unwrap_or_else(|| app.t("hud.noCost").to_string());
+                    ui.label(
+                        RichText::new(text)
+                            .font(mono(12.0))
+                            .color(super::workspace::cost_color(&theme, stats.cost_usd)),
+                    );
+                });
+            });
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(app.t("hud.total"))
+                    .font(sans(12.0))
+                    .color(theme.fg_muted),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    RichText::new(crate::transcripts::fmt_usd(total))
+                        .font(mono(12.0))
+                        .color(color),
+                );
+            });
+        });
+    });
 }

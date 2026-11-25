@@ -37,7 +37,7 @@ pub fn show(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
         .filter(|t| !t.disabled)
         .map(|t| PaneInfo {
             id: t.id.clone(),
-            title: t.title(),
+            title: app.terminal_title(t),
             cwd: t.cwd.clone(),
             is_terminal: t.is_terminal(),
             kind: t.kind.clone().unwrap_or_else(|| "terminal".into()),
@@ -45,7 +45,7 @@ pub fn show(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
             tabs: t
                 .tabs
                 .iter()
-                .map(|s| (s.id.clone(), s.agent.clone(), s.name.clone()))
+                .map(|s| (s.id.clone(), s.agent.clone(), app.tab_title(s)))
                 .collect(),
             active_tab: t.active_tab().map(|s| s.id.clone()).unwrap_or_default(),
         })
@@ -427,6 +427,26 @@ fn pane_ui(
                 .color(theme.fg_faint),
         )
         .on_hover_text(cwd);
+        // Session cost (`TokenHud`, per terminal).
+        if let Some(stats) = app.transcripts.stats(&pane.active_tab) {
+            if stats.total_tokens > 0 {
+                let text = match stats.cost_usd {
+                    Some(usd) => crate::transcripts::fmt_usd(usd),
+                    None => crate::transcripts::fmt_tokens(stats.total_tokens),
+                };
+                ui.label(
+                    RichText::new(text)
+                        .font(mono(11.0))
+                        .color(cost_color(&theme, stats.cost_usd)),
+                )
+                .on_hover_text(format!(
+                    "{} · {} {}",
+                    stats.model.as_deref().unwrap_or("claude"),
+                    crate::transcripts::fmt_tokens(stats.total_tokens),
+                    app.t("hud.tokens")
+                ));
+            }
+        }
         if let Some(s) = status {
             let key = match s {
                 Status::Working => "status.working",
@@ -578,5 +598,15 @@ fn empty_state(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str, area: R
             }
         });
         child.add_space(8.0);
+    }
+}
+
+/// `costLevel`: green under $1, amber under $5, red above; faint without a price.
+pub fn cost_color(theme: &crate::theme::Theme, usd: Option<f64>) -> egui::Color32 {
+    match usd {
+        None => theme.fg_faint,
+        Some(v) if v >= 5.0 => theme.offline,
+        Some(v) if v >= 1.0 => theme.waiting,
+        Some(_) => theme.working,
     }
 }

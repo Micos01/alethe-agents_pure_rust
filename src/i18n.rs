@@ -267,6 +267,10 @@ messages! {
     "usage.resetCredits" => "Créditos de reset", "Reset credits";
     "usage.resetsIn" => "Reinicia em", "Resets in";
     "usage.stale" => "Não foi possível atualizar; leitura anterior.", "Couldn't refresh; showing the last reading.";
+    "hud.title" => "Custo das sessões", "Session cost";
+    "hud.tokens" => "tokens", "tokens";
+    "hud.noCost" => "sem preço", "no price";
+    "hud.total" => "Total", "Total";
     "settings.features" => "Recursos", "Features";
     "settings.orchestrator" => "Orquestrador (MCP)", "Orchestrator (MCP)";
     "settings.orchestratorHint" => "Terminais Claude e Codex recebem o servidor MCP da Alethe e podem delegar tarefas a workers. Vale para terminais abertos depois de ligar.", "Claude and Codex terminals get Alethe's MCP server and can delegate work to workers. Applies to terminals opened after turning it on.";

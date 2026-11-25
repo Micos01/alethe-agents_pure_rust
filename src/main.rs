@@ -14,6 +14,7 @@ mod pomodoro;
 mod storage;
 mod terminal;
 mod theme;
+mod transcripts;
 mod ui;
 mod usage;
 

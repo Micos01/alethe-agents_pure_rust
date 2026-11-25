@@ -192,7 +192,7 @@ fn matches_search(app: &AletheApp, project: &Project) -> bool {
         || project
             .terminals
             .iter()
-            .any(|t| t.title().to_lowercase().contains(&q) || t.agent().contains(&q))
+            .any(|t| app.terminal_title(t).to_lowercase().contains(&q) || t.agent().contains(&q))
 }
 
 fn tree(app: &mut AletheApp, ui: &mut egui::Ui) {
@@ -445,7 +445,14 @@ fn project_node(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
     let terminals: Vec<(String, String, String, Option<crate::terminal::Status>)> = project
         .terminals
         .iter()
-        .map(|t| (t.id.clone(), t.title(), t.agent(), app.terminal_status(t)))
+        .map(|t| {
+            (
+                t.id.clone(),
+                app.terminal_title(t),
+                t.agent(),
+                app.terminal_status(t),
+            )
+        })
         .collect();
     let cwd = project.cwd();
     let group_id = project.group_id.clone();

@@ -206,6 +206,8 @@ pub struct AletheApp {
     notified_blocked: std::collections::HashSet<String>,
     pub memory_mb: Arc<AtomicU64>,
     pub usage: crate::usage::UsageMonitor,
+    pub transcripts: crate::transcripts::TranscriptWatcher,
+    transcripts_fed: Option<Instant>,
     pub orchestrator: Arc<crate::orchestrator::Orchestrator>,
     pub boards: HashMap<String, crate::ui::orchestrator::BoardState>,
     pub markdown: HashMap<String, crate::ui::markdown::MarkdownState>,
@@ -344,6 +346,8 @@ impl AletheApp {
             notified_blocked: Default::default(),
             memory_mb,
             usage: crate::usage::UsageMonitor::start(cc.egui_ctx.clone()),
+            transcripts: crate::transcripts::TranscriptWatcher::start(cc.egui_ctx.clone()),
+            transcripts_fed: None,
             orchestrator,
             boards: HashMap::new(),
             markdown: HashMap::new(),
@@ -391,6 +395,71 @@ impl AletheApp {
 
     pub fn mark_dirty(&mut self) {
         self.dirty_since.get_or_insert_with(Instant::now);
+    }
+
+    /// Tells the transcript watcher which Claude tabs are running (at most once a second).
+    fn feed_transcripts(&mut self) {
+        if self
+            .transcripts_fed
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.transcripts_fed = Some(Instant::now());
+        let mut live = Vec::new();
+        for project in &self.data.projects {
+            for terminal in &project.terminals {
+                for tab in &terminal.tabs {
+                    let Some(session_id) = tab.session_id.as_deref() else {
+                        continue;
+                    };
+                    if tab.agent != "claude" || !self.sessions.contains_key(&tab.id) {
+                        continue;
+                    }
+                    let cwd = [&tab.cwd, &terminal.cwd]
+                        .into_iter()
+                        .find(|c| !c.trim().is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| project.cwd());
+                    live.push(crate::transcripts::Live {
+                        tab_id: tab.id.clone(),
+                        cwd,
+                        session_id: session_id.to_string(),
+                    });
+                }
+            }
+        }
+        self.transcripts.set_live(live);
+    }
+
+    pub fn find_tab(&self, tab_id: &str) -> Option<&crate::model::SubTab> {
+        self.data
+            .projects
+            .iter()
+            .flat_map(|p| &p.terminals)
+            .flat_map(|t| &t.tabs)
+            .find(|t| t.id == tab_id)
+    }
+
+    /// A sub-tab's label: its own name once renamed, else the chat title, else the agent name.
+    pub fn tab_title(&self, tab: &crate::model::SubTab) -> String {
+        if tab.name == crate::agents::info(&tab.agent).short {
+            if let Some(title) = self.transcripts.stats(&tab.id).and_then(|s| s.title) {
+                return title;
+            }
+        }
+        tab.name.clone()
+    }
+
+    /// `Terminal::title`, with the chat title for an agent tab nobody renamed.
+    pub fn terminal_title(&self, terminal: &crate::model::Terminal) -> String {
+        if terminal.custom_name.unwrap_or(false) {
+            return terminal.title();
+        }
+        terminal
+            .active_tab()
+            .map(|t| self.tab_title(t))
+            .unwrap_or_else(|| terminal.title())
     }
 
     /// `preferences.usageAccess[provider]`: off unless the user turned it on.
@@ -917,6 +986,7 @@ impl AletheApp {
             .set_access(self.usage_access("claude"), self.usage_access("codex"));
         self.poll_notifications();
         self.tick_pomodoro();
+        self.feed_transcripts();
         let actions: Vec<Action> = self.actions.borrow_mut().drain(..).collect();
         for action in actions {
             self.apply(action);
