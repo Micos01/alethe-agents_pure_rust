@@ -9,6 +9,7 @@ pub mod mcp;
 pub mod modals;
 pub mod orchestrator;
 pub mod sidebar;
+pub mod skills;
 pub mod titlebar;
 pub mod todos;
 pub mod widgets;

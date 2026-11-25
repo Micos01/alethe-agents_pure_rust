@@ -19,3 +19,6 @@ pub mod mcp_agents;
 #[allow(dead_code)] // config paths and secret reveal are not wired to the UI yet
 pub mod mcp_store;
 pub mod mcp_support;
+#[rustfmt::skip]
+#[allow(dead_code)] // the bundled-skill catalog is not wired to the UI yet
+pub mod skills;

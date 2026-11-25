@@ -290,6 +290,16 @@ messages! {
     "resources.systemFree" => "Livre no sistema", "Free on the system";
     "resources.lowHint" => "Pouca memória livre: suspenda projetos ociosos pelo menu da sidebar.", "Low free memory: suspend idle projects from the sidebar menu.";
     "mcp.title" => "Servidores MCP", "MCP servers";
+    "mcp.tabServers" => "Servidores", "Servers";
+    "mcp.tabSkills" => "Skills", "Skills";
+    "skills.search" => "Buscar skill", "Search skills";
+    "skills.emptyTitle" => "Nenhuma skill instalada", "No skills installed";
+    "skills.installedIn" => "Instalada em", "Installed in";
+    "skills.linked" => "link", "link";
+    "skills.bundled" => "do sistema", "built-in";
+    "skills.remove" => "Remover deste agente", "Remove from this agent";
+    "skills.confirmRemove" => "Confirmar remoção", "Confirm removal";
+    "skills.removed" => "Removida de {agent}.", "Removed from {agent}.";
     "mcp.refresh" => "Recarregar", "Reload";
     "mcp.scopeGlobal" => "Global", "Global";
     "mcp.scopeProject" => "Projeto", "Project";

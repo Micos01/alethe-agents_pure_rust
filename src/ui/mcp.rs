@@ -55,6 +55,9 @@ pub struct McpPanelState {
     adding: Option<AddForm>,
     /// The last write's outcome: (text, failed).
     message: Option<(String, bool)>,
+    /// Showing installed skills instead of servers.
+    show_skills: bool,
+    pub skills: super::skills::SkillsState,
 }
 
 /// One server name across agents (`groupServersByName`).
@@ -193,6 +196,7 @@ pub fn panel(app: &mut AletheApp, ui: &mut egui::Ui) {
     let state = &mut app.mcp_panel;
     if state.scope.is_none() {
         state.scope = Some(scope_pref);
+        state.show_skills = std::env::var("ALETHE_NATIVE_SMOKE").as_deref() == Ok("@skills");
     }
     if !state.loaded && state.pending.is_none() || state.repo != repo {
         state.repo = repo.clone();
@@ -210,12 +214,18 @@ pub fn panel(app: &mut AletheApp, ui: &mut egui::Ui) {
         .inner_margin(Margin::symmetric(14, 8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(icons::PLUG).font(mono(14.0)).color(theme.fg));
-                ui.label(
-                    RichText::new(t("mcp.title"))
-                        .font(widgets::bold(14.5))
-                        .color(theme.fg),
-                );
+                let show_skills = app.mcp_panel.show_skills;
+                for (skills, key) in [(false, "mcp.tabServers"), (true, "mcp.tabSkills")] {
+                    if ui
+                        .selectable_label(
+                            show_skills == skills,
+                            RichText::new(t(key)).font(widgets::bold(13.0)),
+                        )
+                        .clicked()
+                    {
+                        app.mcp_panel.show_skills = skills;
+                    }
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if widgets::icon_button(ui, &theme, icons::LAYOUT_SIDEBAR_RIGHT, "", 24.0)
                         .clicked()
@@ -226,10 +236,17 @@ pub fn panel(app: &mut AletheApp, ui: &mut egui::Ui) {
                     if widgets::icon_button(ui, &theme, icons::REFRESH, t("mcp.refresh"), 24.0)
                         .clicked()
                     {
-                        rescan = true;
+                        if show_skills {
+                            state.skills.refresh(ui.ctx());
+                        } else {
+                            rescan = true;
+                        }
                     }
-                    if loading {
+                    if loading || (show_skills && state.skills.loading()) {
                         ui.add(egui::Spinner::new().size(12.0));
+                    }
+                    if show_skills {
+                        return;
                     }
                     // Scope switch.
                     for (value, key) in [
@@ -272,6 +289,10 @@ pub fn panel(app: &mut AletheApp, ui: &mut egui::Ui) {
     }
     if rescan {
         app.mcp_panel.rescan(ui.ctx());
+    }
+    if app.mcp_panel.show_skills {
+        super::skills::view(app, ui);
+        return;
     }
 
     if app.mcp_panel.adding.is_some() {

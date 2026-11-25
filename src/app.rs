@@ -324,11 +324,11 @@ impl AletheApp {
             // `ALETHE_NATIVE_SMOKE=@agents` / `@todo` / `@mcp` open with that right panel showing.
             show_right: matches!(
                 std::env::var("ALETHE_NATIVE_SMOKE").as_deref(),
-                Ok("@agents" | "@todo" | "@mcp")
+                Ok("@agents" | "@todo" | "@mcp" | "@skills")
             ),
             right_tab: match std::env::var("ALETHE_NATIVE_SMOKE").as_deref() {
                 Ok("@agents") => RightTab::Agents,
-                Ok("@mcp") => RightTab::Mcp,
+                Ok("@mcp" | "@skills") => RightTab::Mcp,
                 _ => RightTab::Todos,
             },
             planner_tabs: Default::default(),
