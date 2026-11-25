@@ -11,7 +11,7 @@ use crate::terminal::{SpawnSpec, Status, TermSize, TerminalSession};
 use crate::theme::Theme;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -61,14 +61,26 @@ pub enum Modal {
     DeleteProject {
         id: String,
     },
+    /// Confirms stopping a group's or a project's terminals.
+    Suspend {
+        target: SuspendTarget,
+    },
     Settings,
     About,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SuspendTarget {
+    Group(String),
+    Project(String),
 }
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub enum Action {
     OpenHome,
+    Suspend(SuspendTarget),
+    Reactivate(SuspendTarget),
     OpenProject(String),
     CloseTab(String),
     NewTerminal {
@@ -205,6 +217,8 @@ pub struct AletheApp {
     notified_revision: u64,
     notified_blocked: std::collections::HashSet<String>,
     pub memory_mb: Arc<AtomicU64>,
+    pub resources: crate::resources::ResourceMonitor,
+    memory_warned_at: Option<Instant>,
     pub usage: crate::usage::UsageMonitor,
     pub transcripts: crate::transcripts::TranscriptWatcher,
     transcripts_fed: Option<Instant>,
@@ -254,7 +268,8 @@ impl AletheApp {
             .unwrap_or_else(crate::storage::home_dir);
 
         let memory_mb = Arc::new(AtomicU64::new(0));
-        spawn_memory_probe(Arc::clone(&memory_mb), cc.egui_ctx.clone());
+        let resources =
+            crate::resources::ResourceMonitor::start(Arc::clone(&memory_mb), cc.egui_ctx.clone());
 
         let mut toasts = Vec::new();
         let lang = Lang::from_code(&data.preferences.language);
@@ -345,6 +360,8 @@ impl AletheApp {
             notified_revision: 0,
             notified_blocked: Default::default(),
             memory_mb,
+            resources,
+            memory_warned_at: None,
             usage: crate::usage::UsageMonitor::start(cc.egui_ctx.clone()),
             transcripts: crate::transcripts::TranscriptWatcher::start(cc.egui_ctx.clone()),
             transcripts_fed: None,
@@ -406,6 +423,13 @@ impl AletheApp {
             return;
         }
         self.transcripts_fed = Some(Instant::now());
+        self.resources.set_roots(
+            self.sessions
+                .iter()
+                .filter_map(|(tab, s)| Some((tab.clone(), s.pid?)))
+                .collect(),
+        );
+        self.warn_memory();
         let mut live = Vec::new();
         for project in &self.data.projects {
             for terminal in &project.terminals {
@@ -439,6 +463,100 @@ impl AletheApp {
             .flat_map(|p| &p.terminals)
             .flat_map(|t| &t.tabs)
             .find(|t| t.id == tab_id)
+    }
+
+    /// `resources.criticalTitle`: the system is about to run out of memory. At most every 2 min.
+    fn warn_memory(&mut self) {
+        let memory = self.resources.snapshot();
+        if memory.pressure != crate::resources::Pressure::Critical
+            || self
+                .memory_warned_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(120))
+        {
+            return;
+        }
+        self.memory_warned_at = Some(Instant::now());
+        let body = self
+            .t("resources.criticalBody")
+            .replace("{free}", &memory.system_available_mb.to_string())
+            .replace("{ptys}", &memory.terminals_mb().to_string());
+        let title = self.t("resources.criticalTitle").to_string();
+        self.notify(title, body, None);
+    }
+
+    /// The projects a suspend target covers: a group's, its subgroups' included.
+    pub fn suspend_scope(&self, target: &SuspendTarget) -> Vec<String> {
+        match target {
+            SuspendTarget::Project(id) => vec![id.clone()],
+            SuspendTarget::Group(id) => {
+                let mut groups = vec![id.clone()];
+                let mut i = 0;
+                while i < groups.len() {
+                    for g in &self.data.groups {
+                        if g.parent_group_id.as_deref() == Some(groups[i].as_str())
+                            && !groups.contains(&g.id)
+                        {
+                            groups.push(g.id.clone());
+                        }
+                    }
+                    i += 1;
+                }
+                self.data
+                    .projects
+                    .iter()
+                    .filter(|p| p.group_id.as_ref().is_some_and(|g| groups.contains(g)))
+                    .map(|p| p.id.clone())
+                    .collect()
+            }
+        }
+    }
+
+    /// Running terminal tabs (processes) a suspend would stop.
+    pub fn running_in(&self, target: &SuspendTarget) -> usize {
+        let scope = self.suspend_scope(target);
+        self.data
+            .projects
+            .iter()
+            .filter(|p| scope.contains(&p.id))
+            .flat_map(|p| &p.terminals)
+            .flat_map(|t| &t.tabs)
+            .filter(|tab| self.sessions.contains_key(&tab.id))
+            .count()
+    }
+
+    fn set_suspended(&mut self, target: &SuspendTarget, suspend: bool) {
+        let scope = self.suspend_scope(target);
+        let mut tabs = Vec::new();
+        for project in self
+            .data
+            .projects
+            .iter_mut()
+            .filter(|p| scope.contains(&p.id))
+        {
+            if suspend {
+                project
+                    .extra
+                    .insert("suspended".into(), serde_json::json!(true));
+            } else {
+                project.extra.remove("suspended");
+            }
+            for terminal in &mut project.terminals {
+                terminal.disabled = suspend;
+                tabs.extend(terminal.tabs.iter().map(|t| t.id.clone()));
+            }
+        }
+        if suspend {
+            // Ends the process trees; reactivating starts them again, Claude resuming its session.
+            for tab in &tabs {
+                self.kill_tab(tab);
+            }
+        }
+        if let SuspendTarget::Group(id) = target {
+            if let Some(group) = self.data.groups.iter_mut().find(|g| &g.id == id) {
+                group.suspended = suspend.then_some(true);
+            }
+        }
+        self.mark_dirty();
     }
 
     /// A sub-tab's label: its own name once renamed, else the chat title, else the agent name.
@@ -1279,6 +1397,8 @@ impl AletheApp {
                 }
                 self.mark_dirty();
             }
+            Action::Suspend(target) => self.set_suspended(&target, true),
+            Action::Reactivate(target) => self.set_suspended(&target, false),
             Action::DeleteGroup(id) => {
                 if let Some(pos) = self.data.groups.iter().position(|g| g.id == id) {
                     let group = self.data.groups.remove(pos);
@@ -1338,6 +1458,7 @@ impl AletheApp {
                     project_ids: vec![],
                     parent_group_id: None,
                     archived: None,
+                    suspended: None,
                     created_at: now_ms(),
                     extra: Default::default(),
                 });
@@ -1559,43 +1680,6 @@ fn open_in_file_manager(path: &str) {
 }
 
 /// RAM of this process plus every descendant (agents, shells) — the title bar's `553 MB` pill.
-fn spawn_memory_probe(target: Arc<AtomicU64>, ctx: egui::Context) {
-    std::thread::Builder::new()
-        .name("memory-probe".into())
-        .spawn(move || {
-            use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-            let me = Pid::from_u32(std::process::id());
-            let mut system = System::new();
-            loop {
-                system.refresh_processes_specifics(
-                    ProcessesToUpdate::All,
-                    true,
-                    ProcessRefreshKind::nothing().with_memory(),
-                );
-                let processes = system.processes();
-                let mut total = 0u64;
-                for (pid, process) in processes {
-                    let mut cursor = Some(*pid);
-                    let mut depth = 0;
-                    while let Some(current) = cursor {
-                        if current == me {
-                            total += process.memory();
-                            break;
-                        }
-                        cursor = processes.get(&current).and_then(|p| p.parent());
-                        depth += 1;
-                        if depth > 32 {
-                            break;
-                        }
-                    }
-                }
-                target.store(total / (1024 * 1024), Ordering::Relaxed);
-                ctx.request_repaint();
-                std::thread::sleep(Duration::from_secs(3));
-            }
-        })
-        .ok();
-}
 
 impl eframe::App for AletheApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

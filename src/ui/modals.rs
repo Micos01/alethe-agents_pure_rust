@@ -106,6 +106,27 @@ pub fn show(app: &mut AletheApp, ctx: &egui::Context) {
                         app.act(Action::DeleteProject(id.clone()));
                     }
                 }
+                Modal::Suspend { target } => {
+                    let (name, title_key) = match target {
+                        crate::app::SuspendTarget::Group(id) => (
+                            app.data.groups.iter().find(|g| &g.id == id).map(|g| g.name.clone()),
+                            "resources.suspendGroupTitle",
+                        ),
+                        crate::app::SuspendTarget::Project(id) => {
+                            (app.project(id).map(|p| p.name.clone()), "resources.suspendProjectTitle")
+                        }
+                    };
+                    title(ui, &theme, app.t(title_key));
+                    ui.label(RichText::new(name.unwrap_or_default()).font(widgets::bold(14.0)).color(theme.fg));
+                    ui.add_space(4.0);
+                    let body = app
+                        .t("resources.suspendBody")
+                        .replace("{count}", &app.running_in(target).to_string());
+                    ui.add(egui::Label::new(RichText::new(body).font(sans(13.0)).color(theme.fg_muted)).wrap());
+                    if footer(ui, &theme, app.t("resources.suspend"), app.t("dialog.cancel"), &mut close) {
+                        app.act(Action::Suspend(target.clone()));
+                    }
+                }
                 Modal::Settings => settings(app, ui, width, &mut close),
                 Modal::About => {
                     ui.horizontal(|ui| {

@@ -77,6 +77,9 @@ pub struct Group {
     pub parent_group_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived: Option<bool>,
+    /// "Suspend group": its projects' terminals are stopped and disabled until reactivated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspended: Option<bool>,
     #[serde(default)]
     pub created_at: u64,
     #[serde(flatten)]
@@ -112,6 +115,13 @@ pub struct Project {
     pub created_at: u64,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl Project {
+    /// Suspended to free memory, by itself or with its group.
+    pub fn suspended(&self) -> bool {
+        self.extra.get("suspended").and_then(Value::as_bool) == Some(true)
+    }
 }
 
 fn default_layout() -> String {

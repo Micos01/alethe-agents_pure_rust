@@ -140,8 +140,7 @@ pub fn show(app: &mut AletheApp, ui: &mut egui::Ui) {
             pomodoro_pill(app, ui);
             usage_pills(app, ui);
             cost_hud(app, ui);
-            let mb = app.memory_mb.load(Ordering::Relaxed);
-            pill(ui, &theme, &format!("{mb} MB"), None);
+            memory_pill(app, ui);
             let profile = app.storage.index.active_name();
             pill(ui, &theme, &profile, Some(icons::ACCOUNT));
         });
@@ -689,5 +688,101 @@ fn cost_hud(app: &mut AletheApp, ui: &mut egui::Ui) {
                 );
             });
         });
+    });
+}
+
+/// RAM of the app and its terminals; the split, the heaviest terminals and the system's free
+/// memory on hover (`MemoryAnalyticsModal`, condensed).
+fn memory_pill(app: &mut AletheApp, ui: &mut egui::Ui) {
+    use crate::resources::Pressure;
+    let theme = app.theme.clone();
+    let mb = app.memory_mb.load(Ordering::Relaxed);
+    let memory = app.resources.snapshot();
+    let color = match memory.pressure {
+        Pressure::Critical => theme.offline,
+        Pressure::Warning => theme.waiting,
+        Pressure::Normal => theme.fg_muted,
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(format!("{mb} MB"), mono(11.5), color);
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(galley.size().x + 16.0, 24.0), Sense::hover());
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(6),
+        if response.hovered() {
+            theme.panel_hover
+        } else {
+            theme.bg
+        },
+        Stroke::new(1.0, theme.border),
+        StrokeKind::Inside,
+    );
+    ui.painter().galley(
+        Pos2::new(rect.left() + 8.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    response.on_hover_ui(|ui| {
+        ui.set_min_width(230.0);
+        let row = |ui: &mut egui::Ui, name: &str, value: String, strong: bool| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(name).font(sans(12.0)).color(if strong {
+                    theme.fg
+                } else {
+                    theme.fg_muted
+                }));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(value).font(mono(12.0)).color(theme.fg));
+                });
+            });
+        };
+        ui.label(
+            RichText::new(app.t("resources.title"))
+                .font(widgets::bold(12.5))
+                .color(theme.fg),
+        );
+        row(
+            ui,
+            app.t("resources.app"),
+            format!("{} MB", memory.app_mb),
+            true,
+        );
+        row(
+            ui,
+            app.t("resources.terminals"),
+            format!("{} MB", memory.terminals_mb()),
+            true,
+        );
+        for (tab_id, tab_mb) in memory.tabs.iter().take(6) {
+            let name = app
+                .find_tab(tab_id)
+                .map(|tab| app.tab_title(tab))
+                .unwrap_or_else(|| tab_id.clone());
+            let name: String = if name.chars().count() > 32 {
+                name.chars().take(31).chain(['…']).collect()
+            } else {
+                name
+            };
+            row(ui, &format!("  {name}"), format!("{tab_mb} MB"), false);
+        }
+        ui.separator();
+        row(
+            ui,
+            app.t("resources.systemFree"),
+            format!(
+                "{} / {} MB",
+                memory.system_available_mb, memory.system_total_mb
+            ),
+            false,
+        );
+        if memory.pressure != Pressure::Normal {
+            ui.label(
+                RichText::new(app.t("resources.lowHint"))
+                    .font(sans(11.0))
+                    .color(color),
+            );
+        }
     });
 }

@@ -391,6 +391,21 @@ fn group_header(
             ));
             ui.close();
         }
+        let target = crate::app::SuspendTarget::Group(id.to_string());
+        let suspended = app
+            .data
+            .groups
+            .iter()
+            .any(|g| g.id == id && g.suspended == Some(true));
+        if suspended {
+            if ui.button(app.t("resources.reactivateGroup")).clicked() {
+                app.act(Action::Reactivate(target));
+                ui.close();
+            }
+        } else if ui.button(app.t("resources.suspendGroup")).clicked() {
+            app.act(Action::ShowModal(Modal::Suspend { target }));
+            ui.close();
+        }
         if ui.button(app.t("sidebar.rename")).clicked() {
             app.act(Action::ShowModal(Modal::Rename {
                 target: RenameTarget::Group(id.to_string()),
@@ -456,6 +471,7 @@ fn project_node(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
         .collect();
     let cwd = project.cwd();
     let group_id = project.group_id.clone();
+    let suspended = project.suspended();
     let active = app.view == View::Project(project_id.to_string());
 
     let (rect, response) =
@@ -495,7 +511,8 @@ fn project_node(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
         sans(13.5)
     };
     let max_name = rect.right() - 64.0 - x;
-    let galley = painter.layout_no_wrap(name.clone(), name_font, theme.fg);
+    let name_color = if suspended { theme.fg_faint } else { theme.fg };
+    let galley = painter.layout_no_wrap(name.clone(), name_font, name_color);
     painter
         .with_clip_rect(Rect::from_min_max(
             Pos2::new(x, rect.top()),
@@ -504,7 +521,7 @@ fn project_node(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
         .galley(
             Pos2::new(x, rect.center().y - galley.size().y / 2.0),
             galley,
-            theme.fg,
+            name_color,
         );
 
     // Count, or hover actions (+ / …).
@@ -543,6 +560,14 @@ fn project_node(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
                 theme.fg_muted,
             );
         }
+    } else if suspended {
+        ui.painter().text(
+            Pos2::new(rect.right() - 8.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            app.t("resources.suspended"),
+            mono(10.5),
+            theme.fg_faint,
+        );
     } else {
         ui.painter().text(
             Pos2::new(rect.right() - 16.0, rect.center().y),
@@ -636,6 +661,16 @@ fn project_node(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
                 }
             });
         }
+        let target = crate::app::SuspendTarget::Project(pid.clone());
+        if suspended {
+            if ui.button(app.t("resources.reactivateProject")).clicked() {
+                app.act(Action::Reactivate(target));
+                ui.close();
+            }
+        } else if ui.button(app.t("resources.suspendProject")).clicked() {
+            app.act(Action::ShowModal(Modal::Suspend { target }));
+            ui.close();
+        }
         ui.separator();
         if ui
             .button(RichText::new(app.t("sidebar.delete")).color(theme.offline))
@@ -656,7 +691,7 @@ fn project_node(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
         }
     }
 
-    if !collapsed {
+    if !collapsed && !suspended {
         for (terminal_id, title, agent, status) in terminals {
             terminal_row(app, ui, &terminal_id, &title, &agent, status);
         }

@@ -52,6 +52,10 @@ pub fn show(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
         .collect();
 
     let area = ui.max_rect().shrink(GAP);
+    if app.project(project_id).is_some_and(|p| p.suspended()) {
+        suspended_state(app, ui, project_id, area);
+        return;
+    }
     if panes.is_empty() {
         empty_state(app, ui, project_id, area);
         return;
@@ -608,5 +612,48 @@ pub fn cost_color(theme: &crate::theme::Theme, usd: Option<f64>) -> egui::Color3
         Some(v) if v >= 5.0 => theme.offline,
         Some(v) if v >= 1.0 => theme.waiting,
         Some(_) => theme.working,
+    }
+}
+
+/// A project suspended to free memory: its terminals come back on reactivation.
+fn suspended_state(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str, area: Rect) {
+    let theme = app.theme.clone();
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(area)
+            .layout(Layout::top_down(Align::Center)),
+    );
+    child.add_space(area.height() * 0.28);
+    child.label(
+        RichText::new(icons::PAUSE)
+            .font(mono(30.0))
+            .color(theme.fg_faint),
+    );
+    child.add_space(8.0);
+    child.label(
+        RichText::new(app.t("resources.suspendedTitle"))
+            .font(widgets::bold(17.0))
+            .color(theme.fg),
+    );
+    child.label(
+        RichText::new(app.t("resources.suspendedBody"))
+            .font(sans(13.0))
+            .color(theme.fg_muted),
+    );
+    child.add_space(14.0);
+    if widgets::primary_button(&mut child, &theme, app.t("resources.reactivateProject")).clicked() {
+        let target = match app.project(project_id).and_then(|p| p.group_id.clone()) {
+            Some(group)
+                if app
+                    .data
+                    .groups
+                    .iter()
+                    .any(|g| g.id == group && g.suspended == Some(true)) =>
+            {
+                crate::app::SuspendTarget::Group(group)
+            }
+            _ => crate::app::SuspendTarget::Project(project_id.to_string()),
+        };
+        app.act(Action::Reactivate(target));
     }
 }

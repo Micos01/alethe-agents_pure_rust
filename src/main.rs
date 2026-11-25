@@ -11,6 +11,7 @@ mod model;
 mod notify;
 mod orchestrator;
 mod pomodoro;
+mod resources;
 mod storage;
 mod terminal;
 mod theme;
