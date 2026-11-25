@@ -35,6 +35,7 @@ Preferências → "Reimportar do Alethe" copia de novo.
 |---|---|
 | `backend/` | `child_env`, `cli_resolver`, `orchestrator_core` (+ `rules`, `shells`), `git_control` e `mcp_model`/`mcp_agents`/`mcp_store` copiados do backend Tauri (só os wrappers `#[tauri::command]` foram removidos); `process` porta o kill da árvore de processos e o Job Object que mata os terminais junto com o app. |
 | `orchestrator.rs` | Servidor MCP local (HTTP em 127.0.0.1, com token) que liga os planners Claude/Codex ao core do orquestrador. Só sobe quando o recurso está ligado e um quadro ou planner é aberto. |
+| `orchestrator_shell_host.rs` | Roda os shells que os planners abrem com `alethe_open_shell` (servidor de dev, `docker compose up`, watcher): cada um é um terminal sem pane, controlado pelo quadro e visto ao vivo no inspetor. |
 | `launch.rs`, `agents.rs` | Port de `buildAgentLaunch`: `--session-id`/`--resume` do Claude, `resume` do Codex, flags de modo YOLO etc. |
 | `terminal/` | `alacritty_terminal` + `portable-pty`; renderização, seleção, scrollback, mouse reporting, bracketed paste. |
 | `theme/` | Os 17 temas de interface e as paletas de terminal, gerados de `theme.css`/`xtermThemes.ts` por `tools/gen_themes.py`. |
@@ -63,8 +64,6 @@ Medido no Windows 11 (build release, só o processo do app, sem contar shells/ag
 
 Voz, plugins, panes de navegador/arquivo/imagem/vídeo/diff, sincronização na nuvem e acesso
 remoto. Panes desses tipos aparecem com um aviso, e os dados deles são mantidos.
-
-No orquestrador ainda faltam os shells abertos pelo planner e as arestas animadas (os subagentes nativos do Claude já aparecem no quadro).
 
 ## Licença
 

@@ -32,6 +32,10 @@ pub struct Orchestrator {
     board: Mutex<Value>,
     revision: AtomicU64,
     ctx: egui::Context,
+    /// Runs the shells planners open (`alethe_open_shell`); wired on start.
+    shells: OnceLock<Arc<crate::orchestrator_shell_host::PtyShellHost>>,
+    /// The last shell control that failed, for the board to show once.
+    shell_error: Mutex<Option<String>>,
 }
 
 impl Orchestrator {
@@ -44,6 +48,8 @@ impl Orchestrator {
             board: Mutex::new(Value::Null),
             revision: AtomicU64::new(0),
             ctx,
+            shells: OnceLock::new(),
+            shell_error: Mutex::new(None),
         })
     }
 
@@ -71,6 +77,24 @@ impl Orchestrator {
                 this.ctx.request_repaint();
             }
         }));
+        let host = Arc::new(crate::orchestrator_shell_host::PtyShellHost::new(
+            self.core.clone(),
+            self.ctx.clone(),
+        ));
+        self.core.set_shell_host(host.clone());
+        let _ = self.shells.set(host);
+        // Smoke test hook: `ALETHE_NATIVE_SMOKE_SHELLS="<planner>|<cwd>|<command>;;..."` opens
+        // those shells as if the planner had called `alethe_open_shell`.
+        if let Ok(spec) = std::env::var("ALETHE_NATIVE_SMOKE_SHELLS") {
+            for entry in spec.split(";;") {
+                if let [planner, cwd, command] = entry.splitn(3, '|').collect::<Vec<_>>()[..] {
+                    let planner = Some(planner).filter(|p| !p.is_empty());
+                    if let Err(error) = self.core.open_shell(planner, command, None, cwd) {
+                        eprintln!("[orchestrator] smoke shell: {error}");
+                    }
+                }
+            }
+        }
         self.publish();
 
         if let Some(program) = cli_resolver::find_windows_cli_launcher("codex") {
@@ -300,6 +324,52 @@ impl Orchestrator {
         });
     }
 
+    // ------------------------------------------------------------ shells
+
+    /// The live terminal behind a shell, while its process (or its last screen) is around.
+    pub fn shell_session(&self, pty_id: &str) -> Option<Arc<crate::terminal::TerminalSession>> {
+        self.shells.get().and_then(|host| host.session(pty_id))
+    }
+
+    /// Stop waits up to five seconds for Ctrl+C to land, so every control runs off the UI thread.
+    pub fn shell_control(self: &Arc<Self>, shell_id: String, control: ShellControl) {
+        let this = Arc::clone(self);
+        std::thread::spawn(move || {
+            let result = match control {
+                ShellControl::Stop => this.core.stop_shell(&shell_id),
+                ShellControl::Restart => this.core.restart_shell(&shell_id),
+                ShellControl::Remove => this.core.remove_shell(&shell_id),
+            };
+            if let Err(error) = result {
+                *this.shell_error.lock().unwrap() = Some(error);
+            }
+            this.publish();
+        });
+    }
+
+    pub fn take_shell_error(&self) -> Option<String> {
+        self.shell_error.lock().unwrap().take()
+    }
+
+    /// The last lines a shell printed: live while it runs, the kept tail once it ended.
+    pub fn shell_tail(&self, shell_id: &str, lines: usize) -> Option<String> {
+        self.core
+            .shell_output(shell_id, lines)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+    }
+
+    pub fn kill_shells(&self) {
+        if let Some(host) = self.shells.get() {
+            host.kill_all();
+        }
+    }
+
     fn background<F>(self: &Arc<Self>, work: F)
     where
         F: FnOnce(&Core) -> Result<(), String> + Send + 'static,
@@ -312,6 +382,15 @@ impl Orchestrator {
             this.publish();
         });
     }
+}
+
+/// `ShellControl` minus the two the UI handles itself (play is a restart of a finished shell;
+/// opening the terminal is the inspector).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellControl {
+    Stop,
+    Restart,
+    Remove,
 }
 
 fn endpoint(port: u16) -> String {

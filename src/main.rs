@@ -11,6 +11,7 @@ mod launch;
 mod model;
 mod notify;
 mod orchestrator;
+mod orchestrator_shell_host;
 mod pomodoro;
 mod resources;
 mod storage;

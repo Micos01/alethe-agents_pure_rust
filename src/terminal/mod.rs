@@ -458,6 +458,57 @@ impl TerminalSession {
         self.shared.title.lock().unwrap().clone()
     }
 
+    /// What the terminal shows, scrollback included, as plain text: at most the last `max_bytes`.
+    /// A soft-wrapped row is joined to the next one, so a long line reads as one.
+    pub fn text_tail(&self, max_bytes: usize) -> String {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+        let Ok(term) = self.term.lock() else {
+            return String::new();
+        };
+        let grid = term.grid();
+        let columns = grid.columns();
+        // Read upward only as far as the tail needs: the scrollback can hold thousands of rows.
+        let top = -(grid.history_size() as i32);
+        let mut rows: Vec<(String, bool)> = Vec::new();
+        let mut bytes = 0;
+        let mut line = grid.screen_lines() as i32 - 1;
+        while line >= top && bytes <= max_bytes {
+            let row = &grid[Line(line)];
+            let mut chunk = String::new();
+            for column in 0..columns {
+                let cell = &row[Column(column)];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                chunk.push(cell.c);
+            }
+            let wrapped = row[Column(columns - 1)].flags.contains(Flags::WRAPLINE);
+            if !wrapped {
+                chunk.truncate(chunk.trim_end().len());
+            }
+            bytes += chunk.len() + 1;
+            rows.push((chunk, wrapped));
+            line -= 1;
+        }
+        let mut text = String::with_capacity(bytes);
+        for (chunk, wrapped) in rows.into_iter().rev() {
+            text.push_str(&chunk);
+            if !wrapped {
+                text.push('\n');
+            }
+        }
+        let trimmed = text.trim_end();
+        let start = trimmed.len().saturating_sub(max_bytes);
+        let start = (start..=trimmed.len())
+            .find(|&i| trimmed.is_char_boundary(i))
+            .unwrap_or(trimmed.len());
+        trimmed[start..].to_string()
+    }
+
     pub fn take_clipboard_store(&self) -> Option<String> {
         self.shared.clipboard_store.lock().unwrap().take()
     }

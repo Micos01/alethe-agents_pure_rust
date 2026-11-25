@@ -321,7 +321,8 @@ impl AletheApp {
             view,
             open_tabs,
             focus_request: None,
-            maximized: None,
+            // `ALETHE_NATIVE_SMOKE_MAXIMIZE=<pane id>` opens with that pane maximized.
+            maximized: std::env::var("ALETHE_NATIVE_SMOKE_MAXIMIZE").ok(),
             show_sidebar: true,
             // `ALETHE_NATIVE_SMOKE=@agents` / `@todo` / `@mcp` open with that right panel showing.
             show_right: matches!(
@@ -1815,6 +1816,7 @@ impl eframe::App for AletheApp {
         for session in self.sessions.values() {
             session.kill_blocking();
         }
+        self.orchestrator.kill_shells();
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

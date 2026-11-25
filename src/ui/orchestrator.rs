@@ -17,6 +17,7 @@ use serde::Deserialize;
 use super::icons;
 use super::widgets::{self, bold, mono, sans};
 use crate::app::{Action, AletheApp};
+use crate::orchestrator::ShellControl;
 use crate::theme::Theme;
 
 // ----------------------------------------------------------------- snapshot
@@ -26,9 +27,112 @@ use crate::theme::Theme;
 pub struct Snapshot {
     jobs: Vec<Job>,
     planners: Vec<PlannerInfo>,
+    shells: Vec<ShellInfo>,
     running: usize,
     queued: usize,
     concurrency_limit: usize,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase", default)]
+struct ShellOwnerInfo {
+    id: String,
+}
+
+/// A long-running command a planner opened with `alethe_open_shell` (`OrchestratorShell`).
+#[derive(Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase", default)]
+struct ShellInfo {
+    id: String,
+    name: String,
+    command: String,
+    cwd: String,
+    owner: Option<ShellOwnerInfo>,
+    status: String,
+    exit_code: Option<i64>,
+    started_at_ms: Option<f64>,
+    pty_id: String,
+    /// Hangs off the planner node (its own shell) instead of standing alone.
+    #[serde(skip)]
+    attached: bool,
+}
+
+impl ShellInfo {
+    fn owner_id(&self) -> Option<&str> {
+        self.owner
+            .as_ref()
+            .map(|owner| owner.id.as_str())
+            .filter(|id| !id.is_empty())
+    }
+
+    fn running(&self) -> bool {
+        self.status == "running"
+    }
+
+    fn lane(&self) -> Lane {
+        match self.status.as_str() {
+            "running" => Lane::Running,
+            "exited" if self.exit_code.is_some_and(|code| code != 0) => Lane::Failed,
+            _ => Lane::Finished,
+        }
+    }
+
+    fn status_text(&self, lang: crate::i18n::Lang) -> String {
+        let t = |key: &str| crate::i18n::tr(lang, key);
+        match self.status.as_str() {
+            "running" => t("orchestrator.shell.running").to_string(),
+            "exited" => t("orchestrator.shell.exited").replace(
+                "{code}",
+                &self
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+            ),
+            _ => t("orchestrator.shell.stopped").to_string(),
+        }
+    }
+
+    fn elapsed(&self) -> Option<f64> {
+        let started = self.started_at_ms?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis() as f64;
+        self.running().then(|| ((now - started) / 1000.0).max(0.0))
+    }
+}
+
+/// Whether `path` is `root` or inside it, whatever the slashes and case (Windows paths).
+fn path_under(path: &str, root: &str) -> bool {
+    let norm = |p: &str| p.replace('\\', "/").trim_end_matches('/').to_lowercase();
+    let (path, root) = (norm(path), norm(root));
+    path == root || path.starts_with(&format!("{root}/"))
+}
+
+/// `shellsForBoard`: the active planner's own shells hang off its node; a shell whose planner is
+/// not on this board (gone, or never recorded) stands alone, so a `docker compose up` is never
+/// dropped because the planner that started it closed.
+fn shells_for_board(
+    shells: &[ShellInfo],
+    active: Option<&str>,
+    live: &HashSet<String>,
+) -> Vec<ShellInfo> {
+    let mut board = Vec::new();
+    for shell in shells {
+        let owner = shell.owner_id();
+        if active.is_some() && owner == active {
+            board.push(ShellInfo {
+                attached: true,
+                ..shell.clone()
+            });
+        } else if !owner.is_some_and(|id| live.contains(id)) {
+            board.push(ShellInfo {
+                attached: false,
+                ..shell.clone()
+            });
+        }
+    }
+    board
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -248,6 +352,8 @@ struct Group<'a> {
     runs: Vec<Run<'a>>,
     jobs: Vec<&'a Job>,
     counts: Counts,
+    /// Only the active group's: its planner's shells, then the ones standing alone.
+    shells: Vec<ShellInfo>,
 }
 
 impl Group<'_> {
@@ -312,6 +418,7 @@ fn to_group<'a>(
         agent,
         jobs,
         counts,
+        shells: Vec::new(),
     }
 }
 
@@ -373,6 +480,11 @@ const MIN_SCALE: f32 = 0.35;
 const MAX_SCALE: f32 = 1.6;
 const ZOOM_STEP: f32 = 1.2;
 const PLANNER_H: f32 = 56.0;
+const SHELL_GROUP_H: f32 = 56.0;
+const SHELL_H: f32 = 82.0;
+/// One dash and gap of a running edge, and how long it takes to flow by (`edge-flow`).
+const FLOW_PERIOD: f32 = 12.0;
+const FLOW_SECONDS: f64 = 0.6;
 const RUN_H: f32 = 86.0;
 const RAIL_W: f32 = 264.0;
 const HEADER_H: f32 = 36.0;
@@ -383,6 +495,9 @@ enum NodeKind {
     Planner,
     Run(usize),
     Worker(usize, usize),
+    /// The shells group: `true` hangs off the planner, `false` stands alone.
+    ShellGroup(bool),
+    Shell(usize),
 }
 
 struct Node {
@@ -414,20 +529,27 @@ fn worker_height(job: &Job) -> f32 {
     h
 }
 
-fn layout(runs: &[Run], with_planner: bool) -> Graph {
-    let spans: Vec<f32> = runs
-        .iter()
-        .map(|r| {
-            let n = r.jobs.len().max(1) as f32;
-            n * NODE_WIDTH + (n - 1.0) * SIBLING_GAP
-        })
-        .collect();
-    let mut lefts = Vec::with_capacity(spans.len());
-    let mut cursor = CANVAS_PADDING;
-    for span in &spans {
-        lefts.push(cursor);
-        cursor += span + TREE_GAP;
+fn layout(runs: &[Run], shells: &[ShellInfo], with_planner: bool) -> Graph {
+    // Trees side by side: each run, then the planner's own shells, then the ones standing alone.
+    enum Tree {
+        Run(usize),
+        Shells(bool),
     }
+    let mut trees: Vec<(Tree, usize)> = runs
+        .iter()
+        .enumerate()
+        .map(|(ri, run)| (Tree::Run(ri), run.jobs.len()))
+        .collect();
+    for attached in [true, false] {
+        let count = shells.iter().filter(|s| s.attached == attached).count();
+        if count > 0 {
+            trees.push((Tree::Shells(attached), count));
+        }
+    }
+    let span = |n: usize| {
+        let n = n.max(1) as f32;
+        n * NODE_WIDTH + (n - 1.0) * SIBLING_GAP
+    };
     let run_top = CANVAS_PADDING
         + if with_planner {
             PLANNER_H + LEVEL_GAP
@@ -439,50 +561,99 @@ fn layout(runs: &[Run], with_planner: bool) -> Graph {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let mut bottom = run_top + RUN_H;
-    let mut run_rects = Vec::new();
-    for (ri, run) in runs.iter().enumerate() {
-        let root = Rect::from_min_size(
-            pos2(
-                (lefts[ri] + (spans[ri] - NODE_WIDTH) / 2.0).round(),
-                run_top,
-            ),
-            vec2(NODE_WIDTH, RUN_H),
-        );
-        run_rects.push((root, run.state));
-        nodes.push(Node {
-            kind: NodeKind::Run(ri),
-            rect: root,
-        });
-        for (wi, job) in run.jobs.iter().enumerate() {
-            let rect = Rect::from_min_size(
-                pos2(
-                    lefts[ri] + wi as f32 * (NODE_WIDTH + SIBLING_GAP),
-                    worker_top,
-                ),
-                vec2(NODE_WIDTH, worker_height(job)),
-            );
-            bottom = bottom.max(rect.bottom());
-            edges.push(Edge {
-                from: pos2(root.center().x, root.bottom()),
-                to: pos2(rect.center().x, rect.top()),
-                lane: job.lane(),
-                worker: Some(job.id.clone()),
-            });
-            nodes.push(Node {
-                kind: NodeKind::Worker(ri, wi),
-                rect,
-            });
+    // Roots the planner connects to, and every root (to center the planner when it has none).
+    let mut heads: Vec<(Rect, Lane)> = Vec::new();
+    let mut roots: Vec<Rect> = Vec::new();
+    let mut cursor = CANVAS_PADDING;
+    for (tree, count) in &trees {
+        let left = cursor;
+        let width = span(*count);
+        cursor += width + TREE_GAP;
+        let root_x = (left + (width - NODE_WIDTH) / 2.0).round();
+        match tree {
+            Tree::Run(ri) => {
+                let run = &runs[*ri];
+                let root = Rect::from_min_size(pos2(root_x, run_top), vec2(NODE_WIDTH, RUN_H));
+                heads.push((root, run.state));
+                roots.push(root);
+                nodes.push(Node {
+                    kind: NodeKind::Run(*ri),
+                    rect: root,
+                });
+                for (wi, job) in run.jobs.iter().enumerate() {
+                    let rect = Rect::from_min_size(
+                        pos2(left + wi as f32 * (NODE_WIDTH + SIBLING_GAP), worker_top),
+                        vec2(NODE_WIDTH, worker_height(job)),
+                    );
+                    bottom = bottom.max(rect.bottom());
+                    edges.push(Edge {
+                        from: pos2(root.center().x, root.bottom()),
+                        to: pos2(rect.center().x, rect.top()),
+                        lane: job.lane(),
+                        worker: Some(job.id.clone()),
+                    });
+                    nodes.push(Node {
+                        kind: NodeKind::Worker(*ri, wi),
+                        rect,
+                    });
+                }
+            }
+            Tree::Shells(attached) => {
+                let root =
+                    Rect::from_min_size(pos2(root_x, run_top), vec2(NODE_WIDTH, SHELL_GROUP_H));
+                roots.push(root);
+                let members: Vec<usize> = (0..shells.len())
+                    .filter(|&i| shells[i].attached == *attached)
+                    .collect();
+                let lane = if members.iter().any(|&i| shells[i].running()) {
+                    Lane::Running
+                } else {
+                    Lane::Finished
+                };
+                if *attached {
+                    heads.push((root, lane));
+                }
+                nodes.push(Node {
+                    kind: NodeKind::ShellGroup(*attached),
+                    rect: root,
+                });
+                for (column, &si) in members.iter().enumerate() {
+                    let rect = Rect::from_min_size(
+                        pos2(
+                            left + column as f32 * (NODE_WIDTH + SIBLING_GAP),
+                            worker_top,
+                        ),
+                        vec2(NODE_WIDTH, SHELL_H),
+                    );
+                    bottom = bottom.max(rect.bottom());
+                    edges.push(Edge {
+                        from: pos2(root.center().x, root.bottom()),
+                        to: pos2(rect.center().x, rect.top()),
+                        lane: shells[si].lane(),
+                        worker: Some(shells[si].id.clone()),
+                    });
+                    nodes.push(Node {
+                        kind: NodeKind::Shell(si),
+                        rect,
+                    });
+                }
+            }
         }
     }
     if with_planner {
-        let x = match (run_rects.first(), run_rects.last()) {
+        let centering: Vec<Rect> = if heads.is_empty() {
+            roots.clone()
+        } else {
+            heads.iter().map(|(rect, _)| *rect).collect()
+        };
+        let x = match (centering.first(), centering.last()) {
             (Some(first), Some(last)) => {
-                ((first.0.center().x + last.0.center().x) / 2.0 - NODE_WIDTH / 2.0).round()
+                ((first.center().x + last.center().x) / 2.0 - NODE_WIDTH / 2.0).round()
             }
             _ => CANVAS_PADDING,
         };
         let planner = Rect::from_min_size(pos2(x, CANVAS_PADDING), vec2(NODE_WIDTH, PLANNER_H));
-        for (root, lane) in &run_rects {
+        for (root, lane) in heads.iter().rev() {
             edges.insert(
                 0,
                 Edge {
@@ -501,7 +672,7 @@ fn layout(runs: &[Run], with_planner: bool) -> Graph {
             },
         );
     }
-    let width = if runs.is_empty() {
+    let width = if trees.is_empty() {
         NODE_WIDTH + 2.0 * CANVAS_PADDING
     } else {
         cursor - TREE_GAP + CANVAS_PADDING
@@ -510,6 +681,28 @@ fn layout(runs: &[Run], with_planner: bool) -> Graph {
         nodes,
         edges,
         size: vec2(width, bottom + CANVAS_PADDING),
+    }
+}
+
+/// A running edge's dashes flow from parent to child, like the web board's `edge-flow`.
+fn flowing_line(painter: &egui::Painter, pts: &[Pos2], stroke: Stroke, s: f32, time: f64) {
+    let period = FLOW_PERIOD * s;
+    let (dash, gap) = (7.0 * s, 5.0 * s);
+    let phase = ((time / FLOW_SECONDS).fract() as f32) * period;
+    painter.extend(Shape::dashed_line_with_offset(
+        pts,
+        stroke,
+        &[dash],
+        &[gap],
+        phase,
+    ));
+    // The dash entering at the start: the offset leaves room for a whole gap only.
+    if phase > gap {
+        if let [start, next, ..] = pts {
+            let dir = (*next - *start).normalized();
+            let len = (phase - gap).min((*next - *start).length());
+            painter.line_segment([*start, *start + dir * len], stroke);
+        }
     }
 }
 
@@ -587,6 +780,8 @@ pub struct BoardState {
     diff: Option<(String, DiffSlot)>,
     message: String,
     last_tick: f64,
+    /// Each shell's last output: read at, its status then, and the text.
+    shell_tails: HashMap<String, (f64, String, String)>,
 }
 
 fn fit(graph: Vec2, viewport: Vec2) -> View {
@@ -678,6 +873,7 @@ enum Intent {
     Restart(String),
     RevealPlanner(String),
     ToggleRun(String),
+    Shell(String, ShellControl),
 }
 
 pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, focused: bool) {
@@ -685,6 +881,8 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
     let lang = app.lang();
     let t = |key: &str| crate::i18n::tr(lang, key);
     let enabled = app.feature_enabled("orchestrator");
+    let term_palette = crate::theme::term_palette(&app.terminal_theme_id());
+    let term_font = app.data.preferences.terminal_font_size.clamp(8.0, 28.0);
     if enabled && !app.orchestrator.is_started() {
         if let Err(error) = app.orchestrator.ensure_started() {
             app.spawn_errors.insert(pane_id.to_string(), error);
@@ -760,6 +958,17 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
             .filter(|p| project_tabs.contains(&p.id))
             .cloned()
             .collect(),
+        // A shell shows on its planner's project, or, with no planner here, where its folder is.
+        shells: snapshot
+            .shells
+            .iter()
+            .filter(|shell| match (shell.owner_id(), &project_cwd) {
+                (Some(owner), _) if project_tabs.contains(owner) => true,
+                (_, Some(cwd)) => path_under(&shell.cwd, cwd),
+                (_, None) => true,
+            })
+            .cloned()
+            .collect(),
         running: snapshot.running,
         queued: snapshot.queued,
         concurrency_limit: snapshot.concurrency_limit,
@@ -777,6 +986,17 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
             }
         }
     }
+    // Shells with no planner on this board still get one.
+    if groups.is_empty() && !snapshot.shells.is_empty() {
+        groups.push(to_group(None, None, None, Vec::new()));
+    }
+    let own_running_shells = |id: &Option<String>| {
+        snapshot
+            .shells
+            .iter()
+            .filter(|shell| shell.running() && shell.owner_id() == id.as_deref())
+            .count()
+    };
 
     let mut close = false;
     header_ui(app, ui, header, &snapshot, &groups, &mut close);
@@ -840,7 +1060,7 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
     let preferred = || {
         groups
             .iter()
-            .find(|g| g.jobs.iter().any(|j| j.can_stop()))
+            .find(|g| g.jobs.iter().any(|j| j.can_stop()) || own_running_shells(&g.id) > 0)
             .or_else(|| groups.iter().find(|g| !g.jobs.is_empty()))
             .unwrap_or(&groups[0])
             .key()
@@ -851,6 +1071,15 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
         .filter(|k| state.pinned && groups.iter().any(|g| &g.key() == k))
         .unwrap_or_else(preferred);
     state.active = Some(active_key.clone());
+    let live: HashSet<String> = groups.iter().filter_map(|g| g.id.clone()).collect();
+    let board_shells = shells_for_board(
+        &snapshot.shells,
+        Some(active_key.as_str()).filter(|key| !key.is_empty()),
+        &live,
+    );
+    if let Some(active) = groups.iter_mut().find(|g| g.key() == active_key) {
+        active.shells = board_shells;
+    }
 
     // ---- planner tabs
     let tabs = Rect::from_min_size(body.min, vec2(body.width(), TABS_H));
@@ -907,7 +1136,10 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
         };
         let (badge, badge_color) = match alert {
             Some((lane, n)) => (n.to_string(), lane.color(&theme)),
-            None => (group.jobs.len().to_string(), theme.fg_faint),
+            None => (
+                (group.jobs.len() + own_running_shells(&group.id)).to_string(),
+                theme.fg_faint,
+            ),
         };
         tui.painter().text(
             pos2(r.right() - 10.0, r.center().y),
@@ -938,6 +1170,27 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
     let canvas = Rect::from_min_max(split.min, pos2(split.right() - rail_w, split.bottom()));
     let rail = Rect::from_min_max(pos2(canvas.right(), split.top()), split.max);
 
+    // Each shell card's last line: read every couple of seconds while it runs, once otherwise.
+    let now = ui.input(|i| i.time);
+    for shell in &group.shells {
+        let stale = state
+            .shell_tails
+            .get(&shell.id)
+            .is_none_or(|(at, status, _)| {
+                *status != shell.status || shell.running() && now - at >= 2.0
+            });
+        if stale {
+            let tail = orchestrator.shell_tail(&shell.id, 3).unwrap_or_default();
+            state
+                .shell_tails
+                .insert(shell.id.clone(), (now, shell.status.clone(), tail));
+        }
+    }
+    if group.shells.iter().any(ShellInfo::running) {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs(2));
+    }
+
     canvas_ui(
         ui,
         &theme,
@@ -965,6 +1218,11 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
         .as_ref()
         .and_then(|id| snapshot.jobs.iter().find(|j| &j.id == id))
         .cloned();
+    let selected_shell = state
+        .selected
+        .as_ref()
+        .and_then(|id| group.shells.iter().find(|shell| &shell.id == id))
+        .cloned();
     if let Some(job) = selected_job {
         inspector_ui(
             ui,
@@ -974,6 +1232,18 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
             &job,
             &orchestrator,
             state,
+            &mut intents,
+        );
+    } else if let Some(shell) = selected_shell {
+        shell_inspector(
+            ui,
+            &theme,
+            lang,
+            canvas,
+            &shell,
+            &orchestrator,
+            term_palette,
+            term_font,
             &mut intents,
         );
     }
@@ -996,6 +1266,7 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
             Intent::Answer(job, decision) => orchestrator.answer(job, decision),
             Intent::Stop(job) => orchestrator.cancel(job),
             Intent::Restart(job) => orchestrator.restart(job),
+            Intent::Shell(shell, control) => orchestrator.shell_control(shell, control),
             Intent::ToggleRun(run) => {
                 let state = app.boards.get_mut(pane_id).expect("board state");
                 if !state.closed_runs.remove(&run) {
@@ -1019,6 +1290,12 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
                 }
             }
         }
+    }
+    if let Some(error) = orchestrator.take_shell_error() {
+        app.toasts.push((
+            format!("{}: {error}", t("orchestrator.shell.failed")),
+            std::time::Instant::now(),
+        ));
     }
     border(ui, rect, &theme, focused);
 }
@@ -1209,7 +1486,7 @@ fn canvas_ui(
     intents: &mut Vec<Intent>,
 ) {
     let t = |key: &str| crate::i18n::tr(lang, key);
-    let graph = layout(&group.runs, group.id.is_some());
+    let graph = layout(&group.runs, &group.shells, group.id.is_some());
 
     // Auto-fit until the person pans or zooms; refit whenever the board changes size.
     if !state.moved || state.view.is_none() || state.graph_size != graph.size && !state.moved {
@@ -1275,7 +1552,7 @@ fn canvas_ui(
     let to_screen = |p: Pos2| origin + p.to_vec2() * s;
     let rect_screen = |r: Rect| Rect::from_min_max(to_screen(r.min), to_screen(r.max));
 
-    if group.runs.is_empty() {
+    if group.runs.is_empty() && group.shells.is_empty() {
         painter.text(
             canvas.center(),
             Align2::CENTER_CENTER,
@@ -1286,6 +1563,8 @@ fn canvas_ui(
     }
 
     // Edges under the nodes.
+    let time = ui.input(|i| i.time);
+    let mut flowing = false;
     for edge in &graph.edges {
         let pts: Vec<Pos2> = connector(edge.from, edge.to)
             .into_iter()
@@ -1309,11 +1588,19 @@ fn canvas_ui(
             Lane::Interrupted => {
                 painter.extend(Shape::dotted_line(&pts, color, 4.0 * s, width * s * 0.6))
             }
-            Lane::Running => painter.extend(Shape::dashed_line(&pts, stroke, 7.0 * s, 5.0 * s)),
+            Lane::Running => {
+                flowing |= pts.iter().any(|p| canvas.contains(*p));
+                flowing_line(&painter, &pts, stroke, s, time);
+            }
             _ => {
                 painter.add(Shape::line(pts, stroke));
             }
         }
+    }
+    // About 30 frames a second, and only while a running edge is on screen.
+    if flowing {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(33));
     }
 
     for node in &graph.nodes {
@@ -1338,6 +1625,30 @@ fn canvas_ui(
                     s,
                     job,
                     state.selected.as_deref() == Some(&job.id),
+                    intents,
+                );
+            }
+            NodeKind::ShellGroup(attached) => {
+                let members: Vec<&ShellInfo> = group
+                    .shells
+                    .iter()
+                    .filter(|shell| shell.attached == attached)
+                    .collect();
+                shell_group_node(&painter, theme, lang, r, s, attached, &members);
+            }
+            NodeKind::Shell(si) => {
+                let shell = &group.shells[si];
+                shell_node(
+                    ui,
+                    &painter,
+                    theme,
+                    lang,
+                    pane_id,
+                    r,
+                    s,
+                    shell,
+                    state.shell_tails.get(&shell.id).map(|t| t.2.as_str()),
+                    state.selected.as_deref() == Some(&shell.id),
                     intents,
                 );
             }
@@ -1617,6 +1928,387 @@ fn run_node(
         bold(10.5 * s),
         theme.fg,
     );
+}
+
+fn shell_group_node(
+    painter: &egui::Painter,
+    theme: &Theme,
+    lang: crate::i18n::Lang,
+    r: Rect,
+    s: f32,
+    attached: bool,
+    members: &[&ShellInfo],
+) {
+    let t = |key: &str| crate::i18n::tr(lang, key);
+    card_frame(painter, theme, r, s, theme.bg_elevated, theme.border_strong);
+    let pad = 13.0 * s;
+    let y = r.top() + 11.0 * s;
+    let lane = if members.iter().any(|shell| shell.running()) {
+        Lane::Running
+    } else {
+        Lane::Finished
+    };
+    dot(
+        painter,
+        pos2(r.left() + pad + 3.0 * s, y + 6.0 * s),
+        s,
+        lane,
+        theme,
+    );
+    painter.text(
+        pos2(r.left() + pad + 12.0 * s, y),
+        Align2::LEFT_TOP,
+        t("orchestrator.shellsEyebrow").to_uppercase(),
+        mono(9.5 * s),
+        theme.fg_faint,
+    );
+    let count = members.len();
+    painter.text(
+        pos2(r.right() - pad, y),
+        Align2::RIGHT_TOP,
+        t(if count == 1 {
+            "orchestrator.shellCount"
+        } else {
+            "orchestrator.shellCountPlural"
+        })
+        .replace("{count}", &count.to_string()),
+        mono(10.0 * s),
+        theme.fg_muted,
+    );
+    painter.with_clip_rect(r.shrink(pad * 0.5)).text(
+        pos2(r.left() + pad, y + 19.0 * s),
+        Align2::LEFT_TOP,
+        t(if attached {
+            "orchestrator.shellsLabel"
+        } else {
+            "orchestrator.shellsOrphanLabel"
+        }),
+        bold(13.0 * s),
+        theme.fg,
+    );
+}
+
+/// The controls a shell offers (`shellControls`): a finished one has no process left to stop.
+fn shell_controls(shell: &ShellInfo) -> &'static [(&'static str, &'static str, ShellControl)] {
+    if shell.running() {
+        &[
+            (
+                "orchestrator.shell.stop",
+                icons::DEBUG_STOP,
+                ShellControl::Stop,
+            ),
+            (
+                "orchestrator.shell.restart",
+                icons::DEBUG_RESTART,
+                ShellControl::Restart,
+            ),
+        ]
+    } else {
+        &[
+            (
+                "orchestrator.shell.play",
+                icons::PLAY,
+                ShellControl::Restart,
+            ),
+            (
+                "orchestrator.shell.remove",
+                icons::TRASH,
+                ShellControl::Remove,
+            ),
+        ]
+    }
+}
+
+/// The canvas card for a shell (`ShellNode`): same footprint as a worker, its last output line
+/// read every couple of seconds while it runs.
+#[allow(clippy::too_many_arguments)]
+fn shell_node(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    theme: &Theme,
+    lang: crate::i18n::Lang,
+    pane_id: &str,
+    r: Rect,
+    s: f32,
+    shell: &ShellInfo,
+    tail: Option<&str>,
+    selected: bool,
+    intents: &mut Vec<Intent>,
+) {
+    let t = |key: &str| crate::i18n::tr(lang, key);
+    let lane = shell.lane();
+    let resp = ui.interact(
+        r,
+        egui::Id::unique(("orch-shell", pane_id, &shell.id)),
+        Sense::click(),
+    );
+    let dim = !shell.running() && !selected && !resp.hovered();
+    let fade = |c: Color32| if dim { c.gamma_multiply(0.58) } else { c };
+    let stroke = if selected {
+        theme.accent_border
+    } else if resp.hovered() {
+        theme.border_strong
+    } else {
+        theme.border
+    };
+    card_frame(painter, theme, r, s, fade(theme.bg_elevated), fade(stroke));
+    if selected {
+        painter.rect_stroke(
+            r.expand(1.0),
+            CornerRadius::same((9.0 * s) as u8),
+            Stroke::new(1.0, theme.accent.gamma_multiply(0.5)),
+            StrokeKind::Outside,
+        );
+    }
+    let pad = 11.0 * s;
+    let head_y = r.top() + 17.0 * s;
+    painter.text(
+        pos2(r.left() + pad, head_y),
+        Align2::LEFT_CENTER,
+        icons::TERMINAL,
+        mono(12.0 * s),
+        fade(theme.fg_muted),
+    );
+    dot(
+        painter,
+        pos2(r.left() + pad + 22.0 * s, head_y),
+        s,
+        lane,
+        theme,
+    );
+
+    // Controls, right to left.
+    let controls = shell_controls(shell);
+    let mut x = r.right() - pad - 9.0 * s;
+    for (key, icon, control) in controls.iter().rev() {
+        let button = Rect::from_center_size(pos2(x, head_y), Vec2::splat(18.0 * s));
+        let button_resp = ui.interact(
+            button,
+            egui::Id::unique(("orch-shell-ctl", pane_id, &shell.id, *key)),
+            Sense::click(),
+        );
+        if button_resp.hovered() {
+            painter.rect_filled(button, CornerRadius::same(4), theme.panel_hover);
+        }
+        painter.text(
+            button.center(),
+            Align2::CENTER_CENTER,
+            *icon,
+            mono(11.0 * s),
+            theme.fg_muted,
+        );
+        if button_resp.on_hover_text(t(key)).clicked() {
+            intents.push(Intent::Shell(shell.id.clone(), *control));
+        }
+        x -= 22.0 * s;
+    }
+    painter
+        .with_clip_rect(Rect::from_min_max(r.min, pos2(x - 4.0 * s, r.bottom())))
+        .text(
+            pos2(r.left() + pad + 30.0 * s, head_y),
+            Align2::LEFT_CENTER,
+            &shell.name,
+            bold(11.5 * s),
+            fade(theme.fg),
+        );
+
+    let line = |y: f32, text: &str, font: egui::FontId, color: Color32| {
+        painter
+            .with_clip_rect(Rect::from_min_max(
+                pos2(r.left() + pad, y),
+                pos2(r.right() - pad, y + 16.0 * s),
+            ))
+            .text(pos2(r.left() + pad, y), Align2::LEFT_TOP, text, font, color);
+    };
+    let mut y = r.top() + 31.0 * s;
+    line(y, &shell.command, mono(10.5 * s), fade(theme.fg_muted));
+    y += 18.0 * s;
+    if let Some(last) = tail.and_then(|text| text.lines().rev().find(|l| !l.trim().is_empty())) {
+        line(y, last.trim(), mono(10.0 * s), fade(theme.fg_faint));
+    }
+    y += 16.0 * s;
+    let mut meta = shell.status_text(lang);
+    if let Some(elapsed) = format_elapsed(shell.elapsed()) {
+        meta.push_str(&format!("  ·  {elapsed}"));
+    }
+    line(
+        y,
+        &meta,
+        mono(10.0 * s),
+        match lane {
+            Lane::Finished => fade(theme.fg_faint),
+            lane => lane.color(theme),
+        },
+    );
+
+    let resp = resp.on_hover_text(format!("{}\n{}", shell.command, shell.cwd));
+    if resp.clicked() {
+        intents.push(Intent::Select(Some(shell.id.clone())));
+    }
+    let id = shell.id.clone();
+    resp.context_menu(|ui| {
+        if ui.button(t("orchestrator.menuOpen")).clicked() {
+            intents.push(Intent::Select(Some(id.clone())));
+            ui.close();
+        }
+        for (key, _, control) in controls {
+            if ui.button(t(key)).clicked() {
+                intents.push(Intent::Shell(id.clone(), *control));
+                ui.close();
+            }
+        }
+    });
+}
+
+/// A shell in the inspector: its live terminal while the process (or its last screen) is around,
+/// which also takes typing; the kept tail once it was stopped.
+#[allow(clippy::too_many_arguments)]
+fn shell_inspector(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    lang: crate::i18n::Lang,
+    canvas: Rect,
+    shell: &ShellInfo,
+    orchestrator: &Arc<crate::orchestrator::Orchestrator>,
+    palette: &crate::theme::TermPalette,
+    font_size: f32,
+    intents: &mut Vec<Intent>,
+) {
+    let t = |key: &str| crate::i18n::tr(lang, key);
+    let width = (canvas.width() * 0.66).clamp(300.0, 620.0);
+    let panel = Rect::from_min_max(
+        pos2(canvas.right() - width - 8.0, canvas.top() + 8.0),
+        pos2(canvas.right() - 8.0, canvas.bottom() - 8.0),
+    );
+    let _ = ui.interact(
+        panel,
+        egui::Id::unique(("orch-shell-inspector", &shell.id)),
+        Sense::click_and_drag(),
+    );
+    ui.painter().rect(
+        panel,
+        CornerRadius::same(10),
+        theme.bg_elevated,
+        Stroke::new(1.0, theme.border_strong),
+        StrokeKind::Inside,
+    );
+    let mut pui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(panel.shrink(12.0))
+            .layout(Layout::top_down(Align::Min)),
+    );
+    pui.set_clip_rect(panel);
+    pui.horizontal(|ui| {
+        ui.label(
+            RichText::new(icons::TERMINAL)
+                .font(mono(13.0))
+                .color(theme.fg_muted),
+        );
+        ui.label(RichText::new(&shell.name).font(bold(13.0)).color(theme.fg));
+        ui.label(
+            RichText::new(shell.status_text(lang))
+                .font(mono(11.0))
+                .color(match shell.lane() {
+                    Lane::Finished => theme.fg_faint,
+                    lane => lane.color(theme),
+                }),
+        );
+        if let Some(elapsed) = format_elapsed(shell.elapsed()) {
+            ui.label(
+                RichText::new(elapsed)
+                    .font(mono(11.0))
+                    .color(theme.fg_faint),
+            );
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if widgets::icon_button(
+                ui,
+                theme,
+                icons::CLOSE,
+                t("orchestrator.inspectorClose"),
+                22.0,
+            )
+            .clicked()
+            {
+                intents.push(Intent::Select(None));
+            }
+            for (key, icon, control) in shell_controls(shell).iter().rev() {
+                if widgets::icon_button(ui, theme, icon, t(key), 22.0).clicked() {
+                    intents.push(Intent::Shell(shell.id.clone(), *control));
+                }
+            }
+        });
+    });
+    pui.label(
+        RichText::new(&shell.command)
+            .font(mono(11.0))
+            .color(theme.fg),
+    );
+    pui.label(
+        RichText::new(t("orchestrator.shellCwd").replace("{path}", &shell.cwd))
+            .font(mono(10.5))
+            .color(theme.fg_faint),
+    );
+    pui.add_space(6.0);
+    let body = Rect::from_min_max(
+        pos2(panel.left() + 8.0, pui.cursor().top()),
+        pos2(panel.right() - 8.0, panel.bottom() - 8.0),
+    );
+    if body.height() < 40.0 {
+        return;
+    }
+    match orchestrator.shell_session(&shell.pty_id) {
+        Some(session) => {
+            ui.painter()
+                .rect_filled(body, CornerRadius::same(6), palette.background.c());
+            let (cell_w, cell_h) = crate::terminal::view::cell_metrics(ui.ctx(), font_size);
+            let inner = body.shrink(crate::terminal::view::PADDING);
+            session.resize(
+                crate::terminal::TermSize {
+                    cols: ((inner.width() / cell_w).floor() as usize).max(20),
+                    lines: ((inner.height() / cell_h).floor() as usize).max(4),
+                },
+                cell_w,
+                cell_h,
+            );
+            crate::terminal::view::show(
+                ui,
+                body,
+                egui::Id::unique(("orch-shell-term", &shell.id)),
+                &session,
+                palette,
+                font_size,
+                false,
+            );
+        }
+        None => {
+            let text = orchestrator.shell_tail(&shell.id, 200).unwrap_or_default();
+            let mut tui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(body)
+                    .layout(Layout::top_down(Align::Min)),
+            );
+            tui.set_clip_rect(body);
+            egui::ScrollArea::vertical()
+                .id_salt(("orch-shell-tail", &shell.id))
+                .stick_to_bottom(true)
+                .auto_shrink([false, false])
+                .show(&mut tui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(if text.is_empty() {
+                                t("orchestrator.shell.noOutput").to_string()
+                            } else {
+                                text
+                            })
+                            .font(mono(11.0))
+                            .color(theme.fg_muted),
+                        )
+                        .wrap(),
+                    );
+                });
+        }
+    }
 }
 
 fn blend(a: Color32, b: Color32, amount: f32) -> Color32 {
@@ -2589,6 +3281,7 @@ fn parse_snapshot(mut value: serde_json::Value) -> Snapshot {
     Snapshot {
         jobs: list(&value, "jobs"),
         planners: list(&value, "planners"),
+        shells: list(&value, "shells"),
         running: count("running"),
         queued: count("queued"),
         concurrency_limit: count("concurrencyLimit"),
