@@ -335,9 +335,13 @@ struct Inline {
     quote: u32,
 }
 
+/// A link inside a laid-out paragraph: the byte range of its text, and where it goes.
+type Links = Vec<(std::ops::Range<usize>, String)>;
+
 struct Renderer<'a> {
     theme: &'a Theme,
     job: LayoutJob,
+    links: Links,
     inline: Inline,
     lists: Vec<Option<u64>>,
     pending_item: Option<String>,
@@ -347,7 +351,7 @@ struct Renderer<'a> {
 
 #[derive(Default)]
 struct Table {
-    rows: Vec<Vec<LayoutJob>>,
+    rows: Vec<Vec<(LayoutJob, Links)>>,
     head_rows: usize,
     in_head: bool,
 }
@@ -361,6 +365,7 @@ pub fn render(ui: &mut egui::Ui, theme: &Theme, text: &str) {
     let mut r = Renderer {
         theme,
         job: LayoutJob::default(),
+        links: Vec::new(),
         inline: Inline {
             bold: 0,
             italic: 0,
@@ -441,7 +446,11 @@ impl Renderer<'_> {
             self.job.append(&prefix, 0.0, format);
         }
         let format = self.format();
+        let start = self.job.text.len();
         self.job.append(text, 0.0, format);
+        if let Some(url) = &self.inline.link {
+            self.links.push((start..self.job.text.len(), url.clone()));
+        }
     }
 
     fn flush(&mut self, ui: &mut egui::Ui) {
@@ -449,6 +458,7 @@ impl Renderer<'_> {
             return;
         }
         let mut job = std::mem::take(&mut self.job);
+        let links = std::mem::take(&mut self.links);
         let indent =
             self.lists.len().saturating_sub(1) as f32 * 18.0 + self.inline.quote as f32 * 14.0;
         job.wrap.max_width =
@@ -456,7 +466,7 @@ impl Renderer<'_> {
                 .max(80.0);
         if let Some(table) = &mut self.table {
             if let Some(row) = table.rows.last_mut() {
-                row.push(job);
+                row.push((job, links));
             }
             return;
         }
@@ -469,7 +479,7 @@ impl Renderer<'_> {
                 ui.painter()
                     .rect_filled(r, CornerRadius::same(1), self.theme.border_strong);
             }
-            ui.add(egui::Label::new(job).wrap());
+            linked_label(ui, egui::Label::new(job).wrap(), &links);
         });
     }
 
@@ -609,7 +619,12 @@ impl Renderer<'_> {
             }
             TagEnd::CodeBlock => {
                 if let Some((lang, code)) = self.code.take() {
-                    code_block(ui, self.theme, &lang, code.trim_end_matches('\n'));
+                    let code = code.trim_end_matches('\n');
+                    let drawn = lang.trim().eq_ignore_ascii_case("mermaid")
+                        && super::mermaid::show(ui, self.theme, code);
+                    if !drawn {
+                        code_block(ui, self.theme, &lang, code);
+                    }
                 }
             }
             TagEnd::List(_) => {
@@ -639,6 +654,43 @@ impl Renderer<'_> {
             }
             _ => {}
         }
+    }
+}
+
+/// A label whose link spans open in the browser when clicked (http(s) only, like
+/// `MarkdownRenderer`; `#anchors` and relative paths stay inert).
+fn linked_label(ui: &mut egui::Ui, label: egui::Label, links: &Links) {
+    if links.is_empty() {
+        ui.add(label);
+        return;
+    }
+    let (pos, galley, resp) = label.sense(egui::Sense::click()).layout_in_ui(ui);
+    ui.painter()
+        .galley(pos, galley.clone(), Color32::PLACEHOLDER);
+    let Some(pointer) = resp.hover_pos() else {
+        return;
+    };
+    let cursor = galley.cursor_from_pos(pointer - pos);
+    let text = galley.text();
+    let byte = text
+        .char_indices()
+        .nth(cursor.index.0)
+        .map_or(text.len(), |(b, _)| b);
+    // The cursor sits between characters: the link under the pointer holds the byte at it or
+    // just before it.
+    let hit = links.iter().find(|(range, _)| {
+        range.contains(&byte) || (byte > 0 && range.contains(&(byte - 1)) && byte == range.end)
+    });
+    let Some((_, url)) = hit else {
+        return;
+    };
+    let web = crate::app::is_web_url(url);
+    if web {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let resp = resp.on_hover_text(url.as_str());
+    if web && resp.clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
     }
 }
 
@@ -684,9 +736,9 @@ fn table_view(ui: &mut egui::Ui, theme: &Theme, table: Table) {
                 .spacing(vec2(16.0, 6.0))
                 .show(ui, |ui| {
                     for row in table.rows {
-                        for mut cell in row {
+                        for (mut cell, links) in row {
                             cell.wrap.max_width = f32::INFINITY;
-                            ui.add(egui::Label::new(cell).extend());
+                            linked_label(ui, egui::Label::new(cell).extend(), &links);
                         }
                         ui.end_row();
                     }

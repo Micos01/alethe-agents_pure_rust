@@ -1756,12 +1756,52 @@ fn open_in_file_manager(path: &str) {
 
 /// RAM of this process plus every descendant (agents, shells) — the title bar's `553 MB` pill.
 
+/// eframe is built without its `webbrowser` support, so links (`ui.hyperlink`, markdown) are
+/// opened here: only http(s), in the default browser.
+fn open_requested_urls(ctx: &egui::Context) {
+    let urls = ctx.output_mut(|o| {
+        let mut urls = Vec::new();
+        o.commands.retain(|command| match command {
+            egui::OutputCommand::OpenUrl(open) => {
+                urls.push(open.url.clone());
+                false
+            }
+            _ => true,
+        });
+        urls
+    });
+    for url in urls {
+        open_in_browser(&url);
+    }
+}
+
+pub fn is_web_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://")
+}
+
+pub fn open_in_browser(url: &str) {
+    if !is_web_url(url) {
+        return;
+    }
+    // `FileProtocolHandler` hands the URL to the default browser without a shell parsing it.
+    #[cfg(windows)]
+    let _ = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url.trim()])
+        .spawn();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("xdg-open")
+        .arg(url.trim())
+        .spawn();
+}
+
 impl eframe::App for AletheApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.frame_start(&ctx);
         crate::ui::root(self, ui);
         self.frame_end();
+        open_requested_urls(&ctx);
     }
 
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {

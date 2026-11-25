@@ -6,6 +6,7 @@ pub mod home;
 pub mod icons;
 pub mod markdown;
 pub mod mcp;
+pub mod mermaid;
 pub mod modals;
 pub mod orchestrator;
 pub mod sidebar;
