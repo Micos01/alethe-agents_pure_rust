@@ -10,6 +10,7 @@ mod launch;
 mod model;
 mod notify;
 mod orchestrator;
+mod pomodoro;
 mod storage;
 mod terminal;
 mod theme;

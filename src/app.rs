@@ -133,6 +133,16 @@ pub enum Action {
         tags: Vec<String>,
         project_id: Option<String>,
     },
+    UpdateTodo {
+        id: String,
+        title: String,
+        tags: Vec<String>,
+    },
+    /// Drag and drop: `dragged` takes `target`'s place.
+    ReorderTodo {
+        dragged: String,
+        target: String,
+    },
     ToggleTodo(String),
     DeleteTodo(String),
     SetTheme(String),
@@ -158,6 +168,10 @@ pub struct TodoState {
     pub input: String,
     pub tags: String,
     pub project: Option<String>,
+    pub filter: crate::ui::todos::TodoFilter,
+    pub editing: Option<crate::ui::todos::TodoEdit>,
+    pub dragging: Option<String>,
+    pub settings_open: bool,
 }
 
 pub struct AletheApp {
@@ -183,6 +197,7 @@ pub struct AletheApp {
     pub modal: Option<Modal>,
     pub home: HomeState,
     pub todo: TodoState,
+    pub pomodoro: crate::pomodoro::Pomodoro,
     pub theme: Theme,
     applied_theme: String,
     applied_zoom: f32,
@@ -270,6 +285,7 @@ impl AletheApp {
             storage.profile_dir().join("orchestrator-jobs.json"),
         );
 
+        let pomodoro = crate::pomodoro::Pomodoro::hydrate(&data.preferences.extra, now_ms());
         Self {
             focused_terminal: data.workspace.focused_terminal_id.clone(),
             applied_theme: theme.id.clone(),
@@ -284,8 +300,11 @@ impl AletheApp {
             focus_request: None,
             maximized: None,
             show_sidebar: true,
-            // `ALETHE_NATIVE_SMOKE=@agents` opens with the Agents panel showing.
-            show_right: std::env::var("ALETHE_NATIVE_SMOKE").as_deref() == Ok("@agents"),
+            // `ALETHE_NATIVE_SMOKE=@agents` / `@todo` open with that right panel showing.
+            show_right: matches!(
+                std::env::var("ALETHE_NATIVE_SMOKE").as_deref(),
+                Ok("@agents" | "@todo")
+            ),
             right_tab: if std::env::var("ALETHE_NATIVE_SMOKE").as_deref() == Ok("@agents") {
                 RightTab::Agents
             } else {
@@ -312,9 +331,14 @@ impl AletheApp {
                 input: String::new(),
                 tags: String::new(),
                 project: None,
+                filter: Default::default(),
+                editing: None,
+                dragging: None,
+                settings_open: false,
             },
             theme,
             toasts,
+            pomodoro,
             notified_revision: 0,
             notified_blocked: Default::default(),
             memory_mb,
@@ -365,6 +389,49 @@ impl AletheApp {
 
     pub fn mark_dirty(&mut self) {
         self.dirty_since.get_or_insert_with(Instant::now);
+    }
+
+    /// Applies a Pomodoro transition and persists the session.
+    pub fn pomodoro_update(
+        &mut self,
+        change: impl FnOnce(&mut crate::pomodoro::Pomodoro, crate::pomodoro::Durations, u64),
+    ) {
+        let durations = crate::pomodoro::Durations::from_prefs(&self.data.preferences.extra);
+        change(&mut self.pomodoro, durations, now_ms());
+        self.pomodoro.persist(&mut self.data.preferences.extra);
+        self.mark_dirty();
+    }
+
+    /// Ends a Pomodoro phase whose time is up and says so.
+    fn tick_pomodoro(&mut self) {
+        use crate::pomodoro::{Phase, Status};
+        if self.pomodoro.status != Status::Running {
+            return;
+        }
+        let now = now_ms();
+        match self.pomodoro.tick(now) {
+            Some(phase) => {
+                self.pomodoro.persist(&mut self.data.preferences.extra);
+                self.mark_dirty();
+                let (title, body) = if phase == Phase::Work {
+                    (
+                        "pomodoro.notifyWorkDoneTitle",
+                        "pomodoro.notifyWorkDoneBody",
+                    )
+                } else {
+                    (
+                        "pomodoro.notifyBreakDoneTitle",
+                        "pomodoro.notifyBreakDoneBody",
+                    )
+                };
+                let (title, body) = (self.t(title).to_string(), self.t(body).to_string());
+                self.notify(title, body, None);
+            }
+            None => {
+                let left = self.pomodoro.remaining_ms(now).clamp(50, 1000);
+                self.ctx.request_repaint_after(Duration::from_millis(left));
+            }
+        }
     }
 
     /// The focused terminal's active sub-tab id.
@@ -818,6 +885,7 @@ impl AletheApp {
 
     pub fn frame_end(&mut self) {
         self.poll_notifications();
+        self.tick_pomodoro();
         let actions: Vec<Action> = self.actions.borrow_mut().drain(..).collect();
         for action in actions {
             self.apply(action);
@@ -1245,8 +1313,15 @@ impl AletheApp {
                 project_id,
             } => {
                 if !title.trim().is_empty() {
+                    // New tasks go last among the open ones, above the completed.
+                    let at = self
+                        .data
+                        .todos
+                        .iter()
+                        .position(|t| t.completed)
+                        .unwrap_or(self.data.todos.len());
                     self.data.todos.insert(
-                        0,
+                        at,
                         TodoItem {
                             id: crate::model::new_id(),
                             title: title.trim().to_string(),
@@ -1259,9 +1334,45 @@ impl AletheApp {
                     self.mark_dirty();
                 }
             }
-            Action::ToggleTodo(id) => {
+            Action::UpdateTodo { id, title, tags } => {
                 if let Some(todo) = self.data.todos.iter_mut().find(|t| t.id == id) {
+                    if !title.trim().is_empty() {
+                        todo.title = title.trim().to_string();
+                    }
+                    todo.tags = tags;
+                    self.mark_dirty();
+                }
+            }
+            Action::ReorderTodo { dragged, target } => {
+                let todos = &mut self.data.todos;
+                if let (Some(from), Some(to)) = (
+                    todos.iter().position(|t| t.id == dragged),
+                    todos.iter().position(|t| t.id == target),
+                ) {
+                    let item = todos.remove(from);
+                    todos.insert(to, item);
+                    self.mark_dirty();
+                }
+            }
+            Action::ToggleTodo(id) => {
+                // Completing moves a task to the end; reopening puts it back above the completed.
+                if let Some(from) = self.data.todos.iter().position(|t| t.id == id) {
+                    let mut todo = self.data.todos.remove(from);
                     todo.completed = !todo.completed;
+                    let at = if todo.completed {
+                        self.data.todos.len()
+                    } else {
+                        self.data
+                            .todos
+                            .iter()
+                            .position(|t| t.completed)
+                            .unwrap_or(self.data.todos.len())
+                    };
+                    if todo.completed && self.pomodoro.focus_todo_id.as_deref() == Some(id.as_str())
+                    {
+                        self.pomodoro_update(|p, _, _| p.focus_todo_id = None);
+                    }
+                    self.data.todos.insert(at, todo);
                     self.mark_dirty();
                 }
             }

@@ -137,6 +137,7 @@ pub fn show(app: &mut AletheApp, ui: &mut egui::Ui) {
             {
                 app.show_right = !app.show_right;
             }
+            pomodoro_pill(app, ui);
             let mb = app.memory_mb.load(Ordering::Relaxed);
             pill(ui, &theme, &format!("{mb} MB"), None);
             let profile = app.storage.index.active_name();
@@ -313,5 +314,120 @@ fn project_tabs(app: &mut AletheApp, ui: &mut egui::Ui) {
         if response.middle_clicked() {
             app.act(Action::CloseTab(id.clone()));
         }
+    }
+}
+
+/// `PomodoroTitleBarPill`: ring + countdown (opens the Todo panel) and a pause/resume toggle.
+fn pomodoro_pill(app: &mut AletheApp, ui: &mut egui::Ui) {
+    use crate::pomodoro::Status;
+    let p = app.pomodoro.clone();
+    if p.status == Status::Idle {
+        return;
+    }
+    let theme = app.theme.clone();
+    let lang = app.lang();
+    let now = crate::model::now_ms();
+    let durations = crate::pomodoro::Durations::from_prefs(&app.data.preferences.extra);
+    let color = if p.is_break() {
+        theme.waiting
+    } else {
+        theme.working
+    };
+    let label = crate::pomodoro::countdown(p.remaining_ms(now));
+    let galley = ui.painter().layout_no_wrap(label, mono(11.5), theme.fg);
+    let main_w = 8.0 + 18.0 + 6.0 + galley.size().x + 8.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(main_w + 26.0, 24.0), Sense::hover());
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(6),
+        theme.bg,
+        Stroke::new(1.0, theme.border),
+        StrokeKind::Inside,
+    );
+    // The toggle sits on the right of the pill.
+    let toggle = Rect::from_min_max(Pos2::new(rect.right() - 26.0, rect.top()), rect.max);
+    let main = Rect::from_min_max(rect.min, Pos2::new(toggle.left(), rect.bottom()));
+    let main_r = ui.interact(main, ui.scope_id().with("pomodoro-pill"), Sense::click());
+    let toggle_r = ui.interact(
+        toggle,
+        ui.scope_id().with("pomodoro-toggle"),
+        Sense::click(),
+    );
+    if main_r.hovered() {
+        ui.painter()
+            .rect_filled(main.shrink(1.0), CornerRadius::same(5), theme.panel_hover);
+    }
+    if toggle_r.hovered() {
+        ui.painter()
+            .rect_filled(toggle.shrink(1.0), CornerRadius::same(5), theme.panel_hover);
+    }
+    let ring_center = Pos2::new(main.left() + 8.0 + 9.0, rect.center().y);
+    super::todos::ring(
+        ui.painter(),
+        ring_center,
+        8.0,
+        p.progress(durations, now),
+        color,
+        theme.border_strong,
+        2.0,
+    );
+    ui.painter().text(
+        ring_center,
+        Align2::CENTER_CENTER,
+        if p.is_break() {
+            icons::COFFEE
+        } else {
+            icons::TIMER
+        },
+        mono(8.0),
+        color,
+    );
+    ui.painter().galley(
+        Pos2::new(
+            ring_center.x + 15.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        theme.fg,
+    );
+    ui.painter().vline(
+        toggle.left(),
+        rect.top() + 5.0..=rect.bottom() - 5.0,
+        Stroke::new(1.0, theme.border),
+    );
+    let running = p.status == Status::Running;
+    ui.painter().text(
+        toggle.center(),
+        Align2::CENTER_CENTER,
+        if running { icons::PAUSE } else { icons::PLAY },
+        mono(10.0),
+        theme.fg_muted,
+    );
+    let phase = super::todos::phase_label(lang, p.phase);
+    if main_r
+        .on_hover_text(format!(
+            "{phase} · {}",
+            crate::i18n::tr(lang, "pomodoro.titlebarOpen")
+        ))
+        .clicked()
+    {
+        app.show_right = true;
+        app.right_tab = crate::app::RightTab::Todos;
+        app.agents_panel.forget_auto_open();
+    }
+    let tip = crate::i18n::tr(
+        lang,
+        if running {
+            "pomodoro.pause"
+        } else {
+            "pomodoro.resume"
+        },
+    );
+    if toggle_r.on_hover_text(tip).clicked() {
+        app.pomodoro_update(|p, d, now| match p.status {
+            Status::Running => p.pause(now),
+            Status::Paused => p.resume(now),
+            _ => p.start(None, d, now),
+        });
     }
 }

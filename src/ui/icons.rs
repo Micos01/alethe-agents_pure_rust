@@ -78,3 +78,10 @@ pub fn agent_image(agent: &str, size: f32) -> Option<egui::Image<'static>> {
             .corner_radius(3),
     )
 }
+pub const GRIP: &str = "\u{f01dd}";
+pub const FOCUS: &str = "\u{f05b}";
+pub const PLAY: &str = "\u{f04b}";
+pub const PAUSE: &str = "\u{f04c}";
+pub const COFFEE: &str = "\u{f0f4}";
+pub const TIMER: &str = "\u{f017}";
+pub const RESET: &str = "\u{f0e2}";
