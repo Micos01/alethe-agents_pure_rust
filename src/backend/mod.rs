@@ -5,4 +5,9 @@
 pub mod child_env;
 #[rustfmt::skip]
 pub mod cli_resolver;
+#[rustfmt::skip]
+pub mod orchestrator_core;
 pub mod process;
+#[rustfmt::skip]
+pub mod git_control;
+pub mod git_support;

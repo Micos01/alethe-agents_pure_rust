@@ -8,6 +8,7 @@ mod backend;
 mod i18n;
 mod launch;
 mod model;
+mod orchestrator;
 mod storage;
 mod terminal;
 mod theme;

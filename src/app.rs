@@ -21,6 +21,13 @@ pub enum View {
     Project(String),
 }
 
+/// Which panel the left sidebar shows below its switcher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarTab {
+    Projects,
+    Git,
+}
+
 #[derive(Clone, Debug)]
 pub enum RenameTarget {
     Project(String),
@@ -126,6 +133,10 @@ pub enum Action {
     SetLanguage(String),
     Reimport,
     OpenFolder(String),
+    /// Adds an Orchestration board pane to the project.
+    NewOrchestration(String),
+    /// Asks for a `.md` file and opens it as a pane in the project.
+    OpenMarkdown(String),
     Toast(String),
 }
 
@@ -156,6 +167,8 @@ pub struct AletheApp {
     pub show_sidebar: bool,
     pub show_right: bool,
     pub sidebar_search: String,
+    pub sidebar_tab: SidebarTab,
+    pub git_panel: crate::ui::git_panel::GitPanel,
     pub modal: Option<Modal>,
     pub home: HomeState,
     pub todo: TodoState,
@@ -164,6 +177,9 @@ pub struct AletheApp {
     applied_zoom: f32,
     pub toasts: Vec<(String, Instant)>,
     pub memory_mb: Arc<AtomicU64>,
+    pub orchestrator: Arc<crate::orchestrator::Orchestrator>,
+    pub boards: HashMap<String, crate::ui::orchestrator::BoardState>,
+    pub markdown: HashMap<String, crate::ui::markdown::MarkdownState>,
     actions: RefCell<Vec<Action>>,
     ctx: egui::Context,
 }
@@ -227,9 +243,19 @@ impl AletheApp {
             let folder = parts.next().unwrap_or_default().to_string();
             let prompt = parts.next().unwrap_or_default().to_string();
             if !agent.starts_with('@') {
-                initial_actions.push(Action::QuickStart { agent, folder, prompt, yolo: false });
+                initial_actions.push(Action::QuickStart {
+                    agent,
+                    folder,
+                    prompt,
+                    yolo: false,
+                });
             }
         }
+
+        let orchestrator = crate::orchestrator::Orchestrator::new(
+            cc.egui_ctx.clone(),
+            storage.profile_dir().join("orchestrator-jobs.json"),
+        );
 
         Self {
             focused_terminal: data.workspace.focused_terminal_id.clone(),
@@ -247,6 +273,13 @@ impl AletheApp {
             show_sidebar: true,
             show_right: false,
             sidebar_search: String::new(),
+            // `ALETHE_NATIVE_SMOKE=@git` opens on the Source Control tab.
+            sidebar_tab: if std::env::var("ALETHE_NATIVE_SMOKE").as_deref() == Ok("@git") {
+                SidebarTab::Git
+            } else {
+                SidebarTab::Projects
+            },
+            git_panel: Default::default(),
             modal: None,
             home: HomeState {
                 prompt: String::new(),
@@ -262,9 +295,37 @@ impl AletheApp {
             theme,
             toasts,
             memory_mb,
+            orchestrator,
+            boards: HashMap::new(),
+            markdown: HashMap::new(),
             actions: RefCell::new(initial_actions),
             ctx: cc.egui_ctx.clone(),
         }
+    }
+
+    /// `preferences.enabledFeatures[id]`, the toggles the Tauri build keeps for optional features.
+    pub fn feature_enabled(&self, id: &str) -> bool {
+        self.data
+            .preferences
+            .extra
+            .get("enabledFeatures")
+            .and_then(|f| f.get(id))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub fn set_feature(&mut self, id: &str, on: bool) {
+        let features = self
+            .data
+            .preferences
+            .extra
+            .entry("enabledFeatures")
+            .or_insert_with(|| serde_json::json!({}));
+        if !features.is_object() {
+            *features = serde_json::json!({});
+        }
+        features[id] = serde_json::Value::Bool(on);
+        self.mark_dirty();
     }
 
     pub fn lang(&self) -> Lang {
@@ -356,6 +417,7 @@ impl AletheApp {
         let terminal = &mut project.terminals[index];
         terminal.last_used_at = Some(now_ms());
         let terminal_cwd = terminal.cwd.clone();
+        let terminal_name = terminal.name.clone();
         let tab = terminal.active_tab_mut()?;
 
         let info = crate::agents::info(&tab.agent);
@@ -383,6 +445,37 @@ impl AletheApp {
         };
         let run_as_admin = tab.run_as_admin.unwrap_or(false);
 
+        // With the orchestrator on, Claude and Codex terminals are planners: they get the `alethe`
+        // MCP server and can delegate to workers shown on the Orchestration board.
+        let mut planner_env: Option<String> = None;
+        if self.feature_enabled("orchestrator") && matches!(agent.as_str(), "claude" | "codex") {
+            let planner = crate::backend::orchestrator_core::Planner {
+                id: tab_id.clone(),
+                label: terminal_name,
+                agent: agent.clone(),
+            };
+            self.orchestrator
+                .apply_settings(self.data.preferences.extra.get("orchestration"));
+            if agent == "claude" {
+                match self.orchestrator.claude_config(&planner) {
+                    Ok(path) => {
+                        let mut with_mcp = vec![
+                            "--mcp-config".to_string(),
+                            path.to_string_lossy().to_string(),
+                        ];
+                        with_mcp.append(&mut args);
+                        args = with_mcp;
+                    }
+                    Err(error) => eprintln!("[orchestrator] {error}"),
+                }
+            } else {
+                match self.orchestrator.codex_config(&planner, &cwd) {
+                    Ok(()) => planner_env = Some(tab_id.clone()),
+                    Err(error) => eprintln!("[orchestrator] {error}"),
+                }
+            }
+        }
+
         let command: Option<String> = match info.command {
             Some(c) => Some(c.to_string()),
             None if info.id == "unknown" => Some(agent.clone()),
@@ -407,7 +500,12 @@ impl AletheApp {
         );
         self.mark_dirty();
         let builder = match builder {
-            Ok(b) => b,
+            Ok(mut b) => {
+                if let Some(planner) = &planner_env {
+                    b.env("ALETHE_PLANNER", planner);
+                }
+                b
+            }
             Err(error) => {
                 self.spawn_errors.insert(tab_id, error);
                 return None;
@@ -640,6 +738,31 @@ impl AletheApp {
         self.open_project(project_id);
         self.focused_terminal = Some(id.clone());
         self.focus_request = Some(id);
+        self.mark_dirty();
+    }
+
+    /// A pane that is not a terminal: no sub-tabs, no PTY, rendered by its `kind`.
+    fn add_pane(&mut self, project_id: &str, kind: &str, name: String, file_path: Option<String>) {
+        let Some(project) = self.project_mut(project_id) else {
+            return;
+        };
+        let mut pane = Terminal::new("shell", project.cwd());
+        pane.tabs.clear();
+        pane.active_tab_id = String::new();
+        pane.kind = Some(kind.to_string());
+        pane.name = name;
+        if kind == "orchestrator" {
+            pane.id = format!("orchestrator-{}", pane.id);
+        }
+        if let Some(path) = file_path {
+            pane.extra
+                .insert("filePath".into(), serde_json::Value::String(path));
+        }
+        let id = pane.id.clone();
+        project.terminals.push(pane);
+        project.collapsed = false;
+        self.open_project(project_id);
+        self.focused_terminal = Some(id);
         self.mark_dirty();
     }
 
@@ -1018,6 +1141,32 @@ impl AletheApp {
                 Err(error) => self.toasts.push((error, Instant::now())),
             },
             Action::OpenFolder(path) => open_in_file_manager(&path),
+            Action::NewOrchestration(project_id) => {
+                let name = self.t("orchestrator.title").to_string();
+                self.add_pane(&project_id, "orchestrator", name, None);
+            }
+            Action::OpenMarkdown(project_id) => {
+                let start = self
+                    .project(&project_id)
+                    .map(|p| p.cwd())
+                    .unwrap_or_default();
+                let picked = rfd::FileDialog::new()
+                    .add_filter("Markdown", &["md", "markdown", "mdx", "txt"])
+                    .set_directory(&start)
+                    .pick_file();
+                if let Some(path) = picked {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "README.md".into());
+                    self.add_pane(
+                        &project_id,
+                        "markdown",
+                        name,
+                        Some(path.to_string_lossy().to_string()),
+                    );
+                }
+            }
             Action::Toast(text) => self.toasts.push((text, Instant::now())),
         }
     }

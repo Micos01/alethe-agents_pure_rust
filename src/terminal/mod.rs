@@ -19,7 +19,11 @@ use crate::theme::TermPalette;
 /// `getTerminalScrollbackRows` of the web build at its economical tier: agents keep more history
 /// than plain shells. alacritty grows the grid lazily, so unused history costs nothing.
 pub fn scrollback_lines(agent: &str) -> usize {
-    if matches!(agent, "shell" | "wsl") { 3_000 } else { 6_000 }
+    if matches!(agent, "shell" | "wsl") {
+        3_000
+    } else {
+        6_000
+    }
 }
 
 #[derive(Clone, Copy)]

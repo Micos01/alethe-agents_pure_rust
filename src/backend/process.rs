@@ -20,13 +20,18 @@ pub fn kill_process_tree(pid: u32) {
 /// they mean "our own group" and "every process we may signal".
 #[cfg(not(windows))]
 fn process_group_target(pid: u32) -> Option<i32> {
-    i32::try_from(pid).ok().filter(|&pid| pid > 1).map(|pid| -pid)
+    i32::try_from(pid)
+        .ok()
+        .filter(|&pid| pid > 1)
+        .map(|pid| -pid)
 }
 
 #[cfg(not(windows))]
 pub fn kill_process_tree(pid: u32) {
     // portable-pty calls setsid(), so the shell leads its own process group.
-    let Some(group) = process_group_target(pid) else { return };
+    let Some(group) = process_group_target(pid) else {
+        return;
+    };
     unsafe { libc::kill(group, libc::SIGTERM) };
     std::thread::sleep(std::time::Duration::from_millis(200));
     unsafe { libc::kill(group, libc::SIGKILL) };
@@ -41,8 +46,9 @@ pub fn install_kill_on_close_guard() {
     use std::mem::{size_of, zeroed};
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 

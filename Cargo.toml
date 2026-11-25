@@ -19,6 +19,8 @@ portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 which = "6"
+tiny_http = "0.12"
+pulldown-cmark = { version = "0.13", default-features = false }
 rfd = "0.15"
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

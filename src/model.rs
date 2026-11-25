@@ -200,6 +200,15 @@ impl Terminal {
         }
     }
 
+    /// `filePath` of a markdown/file pane.
+    pub fn file_path(&self) -> Option<String> {
+        self.extra
+            .get("filePath")
+            .and_then(Value::as_str)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+    }
+
     pub fn is_terminal(&self) -> bool {
         self.kind.as_deref().is_none_or(|k| k == "terminal")
     }

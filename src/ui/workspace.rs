@@ -18,6 +18,7 @@ struct PaneInfo {
     cwd: String,
     is_terminal: bool,
     kind: String,
+    file_path: Option<String>,
     tabs: Vec<(String, String, String)>, // (id, agent, name)
     active_tab: String,
 }
@@ -40,6 +41,7 @@ pub fn show(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
             cwd: t.cwd.clone(),
             is_terminal: t.is_terminal(),
             kind: t.kind.clone().unwrap_or_else(|| "terminal".into()),
+            file_path: t.file_path(),
             tabs: t
                 .tabs
                 .iter()
@@ -157,6 +159,13 @@ fn pane_ui(
     focus_request: bool,
     project_cwd: &str,
 ) {
+    match (pane.kind.as_str(), &pane.file_path) {
+        ("orchestrator", _) => return super::orchestrator::pane(app, ui, &pane.id, rect, focused),
+        ("markdown", Some(path)) => {
+            return super::markdown::pane(app, ui, &pane.id, &pane.title, path, rect, focused)
+        }
+        _ => {}
+    }
     let theme = app.theme.clone();
     let border = if focused {
         theme.accent_border

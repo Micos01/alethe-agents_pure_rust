@@ -35,6 +35,17 @@ pub const SEND: &str = "\u{f1d8}";
 pub const TAG: &str = "\u{ea66}";
 pub const CHECK: &str = "\u{eab2}";
 pub const SPLIT: &str = "\u{eb56}";
+pub const TYPE_HIERARCHY: &str = "\u{ebb9}";
+pub const DEBUG_STOP: &str = "\u{ead7}";
+pub const GIT_BRANCH: &str = "\u{ea68}";
+pub const ZOOM_IN: &str = "\u{eb81}";
+pub const ZOOM_OUT: &str = "\u{eb82}";
+pub const EDIT: &str = "\u{ea73}";
+pub const SAVE: &str = "\u{eb4b}";
+pub const REFRESH: &str = "\u{eb37}";
+pub const COPY: &str = "\u{ebcc}";
+pub const PREVIEW: &str = "\u{eb2f}";
+pub const WARNING: &str = "\u{ea6c}";
 
 pub fn agent_icon_bytes(file: &str) -> Option<&'static [u8]> {
     Some(match file {

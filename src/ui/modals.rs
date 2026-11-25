@@ -376,6 +376,66 @@ fn settings(app: &mut AletheApp, ui: &mut egui::Ui, width: f32, close: &mut bool
             }
 
             ui.add_space(12.0);
+            section(ui, &theme, app.t("settings.features"));
+            let mut orchestrator_on = app.feature_enabled("orchestrator");
+            if ui
+                .checkbox(
+                    &mut orchestrator_on,
+                    RichText::new(app.t("settings.orchestrator"))
+                        .font(sans(12.5))
+                        .color(theme.fg),
+                )
+                .changed()
+            {
+                app.set_feature("orchestrator", orchestrator_on);
+            }
+            ui.add(
+                egui::Label::new(
+                    RichText::new(app.t("settings.orchestratorHint"))
+                        .font(sans(11.5))
+                        .color(theme.fg_faint),
+                )
+                .wrap(),
+            );
+            if orchestrator_on {
+                let mut max = app
+                    .data
+                    .preferences
+                    .extra
+                    .get("orchestration")
+                    .and_then(|o| o.get("maxConcurrent"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(4) as usize;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(app.t("settings.maxWorkers"))
+                            .font(sans(12.0))
+                            .color(theme.fg_muted),
+                    );
+                    if ui.add(egui::Slider::new(&mut max, 1..=12)).changed() {
+                        let orchestration = app
+                            .data
+                            .preferences
+                            .extra
+                            .entry("orchestration")
+                            .or_insert(serde_json::Value::Null);
+                        if !orchestration.is_object() {
+                            // Same defaults as `DEFAULT_PREFERENCES.orchestration` in the web build.
+                            *orchestration = serde_json::json!({
+                                "roles": [],
+                                "maxConcurrent": 4,
+                                "defaultTimeoutSeconds": 900,
+                                "workerDisabledPlugins": []
+                            });
+                        }
+                        orchestration["maxConcurrent"] = serde_json::json!(max);
+                        app.orchestrator
+                            .apply_settings(app.data.preferences.extra.get("orchestration"));
+                        app.mark_dirty();
+                    }
+                });
+            }
+            ui.add_space(6.0);
             section(ui, &theme, app.t("settings.data"));
             field(ui, &theme, app.t("settings.dataFile"));
             let path = app.storage.projects_path().to_string_lossy().to_string();

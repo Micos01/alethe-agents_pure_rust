@@ -1,9 +1,12 @@
 //! Views. Layout mirrors `App.tsx`: title bar on top, project sidebar on the left, the Home or
 //! Workspace view in the middle and the Todo panel on the right.
 
+pub mod git_panel;
 pub mod home;
 pub mod icons;
+pub mod markdown;
 pub mod modals;
+pub mod orchestrator;
 pub mod sidebar;
 pub mod titlebar;
 pub mod todos;

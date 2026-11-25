@@ -5,7 +5,7 @@ use super::icons;
 use super::widgets::{
     self, count_badge, icon_button, icon_button_active, mono, sans, section_label, status_color,
 };
-use crate::app::{Action, AletheApp, Modal, RenameTarget, View};
+use crate::app::{Action, AletheApp, Modal, RenameTarget, SidebarTab, View};
 use crate::model::Project;
 use egui::{
     Align, Align2, Color32, CornerRadius, Layout, Margin, Pos2, Rect, RichText, Sense, Stroke, Vec2,
@@ -23,6 +23,7 @@ pub fn show(app: &mut AletheApp, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 let home = app.view == View::Home;
+                let git_tab = app.sidebar_tab == SidebarTab::Git;
                 if icon_button_active(ui, &theme, icons::HOME, app.t("sidebar.home"), 30.0, home)
                     .clicked()
                 {
@@ -34,21 +35,40 @@ pub fn show(app: &mut AletheApp, ui: &mut egui::Ui) {
                     icons::GRID,
                     app.t("sidebar.projects"),
                     30.0,
-                    !home,
+                    !home && !git_tab,
                 )
                 .clicked()
                 {
+                    app.sidebar_tab = SidebarTab::Projects;
                     if let Some(id) = app.data.workspace.recent_project_ids.first().cloned() {
                         app.act(Action::OpenProject(id));
                     }
                 }
                 ui.add_enabled_ui(false, |ui| {
                     icon_button(ui, &theme, icons::FOLDER, "", 30.0);
-                    icon_button(ui, &theme, icons::SOURCE_CONTROL, "", 30.0);
                 });
+                // Source Control: like the web build's contributed `git` tab, it leaves Home.
+                let git_label = crate::ui::git_panel::tab_label(lang);
+                if icon_button_active(ui, &theme, icons::SOURCE_CONTROL, git_label, 30.0, git_tab)
+                    .clicked()
+                {
+                    app.sidebar_tab = SidebarTab::Git;
+                    if home {
+                        if let Some(id) = app.data.workspace.recent_project_ids.first().cloned() {
+                            app.act(Action::OpenProject(id));
+                        }
+                    }
+                }
             });
         });
     separator(ui, &theme);
+
+    let footer_height = 112.0;
+    if app.sidebar_tab == SidebarTab::Git {
+        crate::ui::git_panel::sidebar_section(app, ui, full.bottom() - footer_height);
+        pinned_footer(app, ui, full, footer_height);
+        return;
+    }
 
     // Search.
     egui::Frame::new()
@@ -125,7 +145,6 @@ pub fn show(app: &mut AletheApp, ui: &mut egui::Ui) {
             });
         });
 
-    let footer_height = 112.0;
     let tree_height = (full.bottom() - ui.cursor().top() - footer_height).max(40.0);
     egui::ScrollArea::vertical()
         .max_height(tree_height)
@@ -136,7 +155,11 @@ pub fn show(app: &mut AletheApp, ui: &mut egui::Ui) {
             ui.add_space(12.0);
         });
 
-    // Footer pinned at the bottom.
+    pinned_footer(app, ui, full, footer_height);
+}
+
+/// Workspace layout + profile rows, pinned at the bottom of the sidebar.
+fn pinned_footer(app: &mut AletheApp, ui: &mut egui::Ui, full: Rect, footer_height: f32) {
     let footer = Rect::from_min_max(
         Pos2::new(full.left(), full.bottom() - footer_height),
         full.right_bottom(),
@@ -531,7 +554,30 @@ fn project_node(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
             cwd: None,
             extra_args: vec![],
             initial_input: None,
-        })
+        });
+        ui.separator();
+        if ui
+            .button(format!(
+                "{}  {}",
+                super::icons::TYPE_HIERARCHY,
+                app.t("sidebar.newOrchestration")
+            ))
+            .clicked()
+        {
+            app.act(Action::NewOrchestration(pid.clone()));
+            ui.close();
+        }
+        if ui
+            .button(format!(
+                "{}  {}",
+                super::icons::MARKDOWN,
+                app.t("sidebar.openMarkdown")
+            ))
+            .clicked()
+        {
+            app.act(Action::OpenMarkdown(pid.clone()));
+            ui.close();
+        }
     });
     let menu_contents = |app: &mut AletheApp, ui: &mut egui::Ui| {
         ui.menu_button(app.t("sidebar.newTerminal"), |ui| {
