@@ -457,7 +457,13 @@ fn project_node(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
         .as_deref()
         .and_then(crate::model::parse_hex_color)
         .unwrap_or(theme.accent);
-    let terminals: Vec<(String, String, String, Option<crate::terminal::Status>)> = project
+    let terminals: Vec<(
+        String,
+        String,
+        String,
+        Option<&'static str>,
+        Option<crate::terminal::Status>,
+    )> = project
         .terminals
         .iter()
         .map(|t| {
@@ -465,6 +471,7 @@ fn project_node(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
                 t.id.clone(),
                 app.terminal_title(t),
                 t.agent(),
+                pane_glyph(t.kind.as_deref()),
                 app.terminal_status(t),
             )
         })
@@ -492,10 +499,10 @@ fn project_node(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
     let mut x = rect.left() + 6.0;
     let any_working = terminals
         .iter()
-        .any(|t| t.3 == Some(crate::terminal::Status::Working));
+        .any(|t| t.4 == Some(crate::terminal::Status::Working));
     let dot = if any_working {
         theme.working
-    } else if terminals.iter().any(|t| t.3.is_some()) {
+    } else if terminals.iter().any(|t| t.4.is_some()) {
         theme.waiting
     } else {
         theme.stopped.gamma_multiply(0.5)
@@ -610,6 +617,17 @@ fn project_node(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
             app.act(Action::OpenMarkdown(pid.clone()));
             ui.close();
         }
+        if ui
+            .button(format!(
+                "{}  {}",
+                super::icons::FILE_MEDIA,
+                app.t("sidebar.openImage")
+            ))
+            .clicked()
+        {
+            app.act(Action::OpenImage(pid.clone()));
+            ui.close();
+        }
     });
     let menu_contents = |app: &mut AletheApp, ui: &mut egui::Ui| {
         ui.menu_button(app.t("sidebar.newTerminal"), |ui| {
@@ -692,9 +710,19 @@ fn project_node(app: &mut AletheApp, ui: &mut egui::Ui, project_id: &str) {
     }
 
     if !collapsed && !suspended {
-        for (terminal_id, title, agent, status) in terminals {
-            terminal_row(app, ui, &terminal_id, &title, &agent, status);
+        for (terminal_id, title, agent, glyph, status) in terminals {
+            terminal_row(app, ui, &terminal_id, &title, &agent, glyph, status);
         }
+    }
+}
+
+/// The glyph a pane that is not a terminal shows in place of an agent icon.
+fn pane_glyph(kind: Option<&str>) -> Option<&'static str> {
+    match kind? {
+        "markdown" => Some(super::icons::MARKDOWN),
+        "image" => Some(super::icons::FILE_MEDIA),
+        "orchestrator" => Some(super::icons::TYPE_HIERARCHY),
+        _ => None,
     }
 }
 
@@ -704,6 +732,7 @@ fn terminal_row(
     id: &str,
     title: &str,
     agent: &str,
+    glyph: Option<&'static str>,
     status: Option<crate::terminal::Status>,
 ) {
     let theme = app.theme.clone();
@@ -732,7 +761,19 @@ fn terminal_row(
         status_color(&theme, status),
         status == Some(crate::terminal::Status::Working),
     );
-    widgets::agent_icon(&mut child, &theme, agent, 14.0);
+    match glyph {
+        Some(glyph) => {
+            let (r, _) = child.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+            child.painter().text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                glyph,
+                mono(12.5),
+                theme.fg_muted,
+            );
+        }
+        None => widgets::agent_icon(&mut child, &theme, agent, 14.0),
+    }
     child.label(RichText::new(title).font(sans(12.5)).color(if focused {
         theme.fg
     } else {

@@ -168,6 +168,9 @@ fn pane_ui(
         ("markdown", Some(path)) => {
             return super::markdown::pane(app, ui, &pane.id, &pane.title, path, rect, focused)
         }
+        ("image", Some(path)) => {
+            return super::image_pane::pane(app, ui, &pane.id, &pane.title, path, rect, focused)
+        }
         _ => {}
     }
     let theme = app.theme.clone();

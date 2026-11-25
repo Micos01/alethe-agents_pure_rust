@@ -167,6 +167,7 @@ pub enum Action {
     NewOrchestration(String),
     /// Asks for a `.md` file and opens it as a pane in the project.
     OpenMarkdown(String),
+    OpenImage(String),
     Toast(String),
 }
 
@@ -229,6 +230,7 @@ pub struct AletheApp {
     pub orchestrator: Arc<crate::orchestrator::Orchestrator>,
     pub boards: HashMap<String, crate::ui::orchestrator::BoardState>,
     pub markdown: HashMap<String, crate::ui::markdown::MarkdownState>,
+    pub images: HashMap<String, crate::ui::image_pane::ImageState>,
     actions: RefCell<Vec<Action>>,
     ctx: egui::Context,
 }
@@ -376,6 +378,7 @@ impl AletheApp {
             orchestrator,
             boards: HashMap::new(),
             markdown: HashMap::new(),
+            images: HashMap::new(),
             actions: RefCell::new(initial_actions),
             ctx: cc.egui_ctx.clone(),
         }
@@ -1179,6 +1182,8 @@ impl AletheApp {
         self.usage
             .set_access(self.usage_access("claude"), self.usage_access("codex"));
         self.poll_notifications();
+        let now = self.ctx.input(|i| i.time);
+        crate::ui::image_pane::evict(self, now);
         self.tick_pomodoro();
         self.feed_transcripts();
         let actions: Vec<Action> = self.actions.borrow_mut().drain(..).collect();
@@ -1411,6 +1416,9 @@ impl AletheApp {
                     if self.maximized.as_deref() == Some(&id) {
                         self.maximized = None;
                     }
+                    // A closed image pane gives its texture back now, not on the next eviction.
+                    self.images.remove(&id);
+                    self.markdown.remove(&id);
                     self.mark_dirty();
                 }
             }
@@ -1732,6 +1740,28 @@ impl AletheApp {
                     self.add_pane(
                         &project_id,
                         "markdown",
+                        name,
+                        Some(path.to_string_lossy().to_string()),
+                    );
+                }
+            }
+            Action::OpenImage(project_id) => {
+                let start = self
+                    .project(&project_id)
+                    .map(|p| p.cwd())
+                    .unwrap_or_default();
+                let picked = rfd::FileDialog::new()
+                    .add_filter(self.t("image.filter"), crate::ui::image_pane::EXTENSIONS)
+                    .set_directory(&start)
+                    .pick_file();
+                if let Some(path) = picked {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    self.add_pane(
+                        &project_id,
+                        "image",
                         name,
                         Some(path.to_string_lossy().to_string()),
                     );

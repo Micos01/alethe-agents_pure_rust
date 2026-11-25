@@ -383,6 +383,15 @@ messages! {
     "settings.maxWorkers" => "Workers simultâneos", "Concurrent workers";
     "sidebar.newOrchestration" => "Nova orquestração", "New orchestration";
     "sidebar.openMarkdown" => "Abrir arquivo Markdown…", "Open Markdown file…";
+    "sidebar.openImage" => "Abrir imagem…", "Open image…";
+    "image.filter" => "Imagens", "Images";
+    "image.fit" => "ajustar", "fit";
+    "image.fitHint" => "Alterna entre ajustar ao pane e o tamanho real (duplo clique ajusta)", "Toggles between fit to pane and actual size (double-click fits)";
+    "image.zoomIn" => "Aumentar zoom", "Zoom in";
+    "image.zoomOut" => "Diminuir zoom", "Zoom out";
+    "image.openExternal" => "Abrir no visualizador do sistema", "Open in the system viewer";
+    "image.loading" => "Carregando…", "Loading…";
+    "image.error" => "Não foi possível abrir a imagem", "Could not open the image";
     "markdown.edit" => "Editar", "Edit";
     "markdown.preview" => "Visualizar", "Preview";
     "markdown.save" => "Salvar", "Save";

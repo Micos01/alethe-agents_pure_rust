@@ -3,7 +3,7 @@
 Versão em **Rust puro** do [Alethe](https://github.com/Kc1t/alethe-agents): sem Tauri, sem WebView2 e sem
 JavaScript. A interface é desenhada com [egui](https://github.com/emilk/egui) e segue a versão web o mais de perto
 possível (titlebar com abas de projeto, sidebar com grupos/projetos/terminais, Home com composer, workspace com
-panes, painel de tarefas, temas, orquestrador, controle de versão e pane de Markdown). Os terminais usam o mesmo
+panes, painel de tarefas, temas, orquestrador, controle de versão e panes de Markdown e imagem). Os terminais usam o mesmo
 motor do Alacritty.
 
 O objetivo principal é **consumir menos memória** que a versão Tauri: tudo roda em um único processo nativo,
@@ -39,7 +39,7 @@ Preferências → "Reimportar do Alethe" copia de novo.
 | `launch.rs`, `agents.rs` | Port de `buildAgentLaunch`: `--session-id`/`--resume` do Claude, `resume` do Codex, flags de modo YOLO etc. |
 | `terminal/` | `alacritty_terminal` + `portable-pty`; renderização, seleção, scrollback, mouse reporting, bracketed paste. |
 | `theme/` | Os 17 temas de interface e as paletas de terminal, gerados de `theme.css`/`xtermThemes.ts` por `tools/gen_themes.py`. |
-| `ui/` | Titlebar, sidebar, Home, workspace, tarefas + Pomodoro, modais, quadro e painel de agentes (`orchestrator.rs`), controle de versão (`git_panel.rs`), servidores MCP (`mcp.rs`) e pane de Markdown (`markdown.rs`, com diagramas Mermaid nativos em `mermaid.rs`). |
+| `ui/` | Titlebar, sidebar, Home, workspace, tarefas + Pomodoro, modais, quadro e painel de agentes (`orchestrator.rs`), controle de versão (`git_panel.rs`), servidores MCP (`mcp.rs`) pane de Markdown (`markdown.rs`, com diagramas Mermaid nativos em `mermaid.rs`) e pane de imagem (`image_pane.rs`). |
 | `transcripts.rs`, `codex_sessions.rs` | Título da conversa, custo por terminal e subagentes do Claude, lidos de forma incremental dos transcripts; no Codex, título e tokens do rollout, que é descoberto e associado à aba (o id fica salvo para o resume). |
 | `usage.rs`, `resources.rs` | Uso do Claude/Codex na barra de título (opt-in) e monitor de memória com suspender grupo/projeto. |
 | `storage.rs`, `model.rs` | Leitura/escrita atômica de `projects.json`, importação do Tauri. |
@@ -62,7 +62,7 @@ Medido no Windows 11 (build release, só o processo do app, sem contar shells/ag
 
 ## O que ainda não foi portado
 
-Voz, plugins, panes de navegador/arquivo/imagem/vídeo/diff, sincronização na nuvem e acesso
+Voz, plugins, panes de navegador/arquivo/vídeo/diff, sincronização na nuvem e acesso
 remoto. Panes desses tipos aparecem com um aviso, e os dados deles são mantidos.
 
 ## Licença

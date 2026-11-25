@@ -4,6 +4,7 @@
 pub mod git_panel;
 pub mod home;
 pub mod icons;
+pub mod image_pane;
 pub mod markdown;
 pub mod mcp;
 pub mod mermaid;
