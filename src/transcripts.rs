@@ -37,6 +37,34 @@ pub struct SessionStats {
     /// The model with the most output.
     pub model: Option<String>,
     pub cwd: String,
+    /// Claude's own subagents (the Agent/Task tool), oldest first.
+    pub subagents: Vec<Subagent>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubStatus {
+    Running,
+    Done,
+    Failed,
+    Killed,
+}
+
+/// One Agent/Task call (`nativeSubagentJobs` upstream, read from the transcript instead of hooks).
+#[derive(Clone, Debug)]
+pub struct Subagent {
+    pub tool_use_id: String,
+    /// Names `<session>/subagents/agent-<id>.jsonl`; known once the call is answered.
+    pub agent_id: Option<String>,
+    pub description: String,
+    pub agent_type: String,
+    pub prompt: String,
+    pub started_ms: Option<u64>,
+    pub ended_ms: Option<u64>,
+    pub status: SubStatus,
+    pub result: Option<String>,
+    pub cost_usd: Option<f64>,
+    pub total_tokens: u64,
+    pub model: Option<String>,
 }
 
 pub struct TranscriptWatcher {
@@ -197,6 +225,9 @@ struct Tracker {
     /// A streamed reply is written once per content block, each line repeating the message's
     /// usage: only the last line of a message counts.
     last_message: Option<(String, String, Usage)>,
+    subagents: Vec<Subagent>,
+    /// Each subagent's own transcript, by agent id.
+    sub_trackers: HashMap<String, Tracker>,
 }
 
 impl Tracker {
@@ -209,11 +240,187 @@ impl Tracker {
             ai_title: None,
             first_prompt: None,
             last_message: None,
+            subagents: Vec::new(),
+            sub_trackers: HashMap::new(),
         }
     }
 
-    /// Reads what was appended; true when anything new was read.
+    fn at(path: PathBuf) -> Self {
+        Self {
+            path: Some(path),
+            ..Self::new("")
+        }
+    }
+
+    /// Follows the transcripts of the subagents this session started.
+    fn poll_subagents(&mut self) -> bool {
+        let Some(dir) = self
+            .path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.join(&self.session_id).join("subagents"))
+        else {
+            return false;
+        };
+        let mut changed = false;
+        for sub in &self.subagents {
+            let Some(id) = &sub.agent_id else {
+                continue;
+            };
+            changed |= self
+                .sub_trackers
+                .entry(id.clone())
+                .or_insert_with(|| Tracker::at(dir.join(format!("agent-{id}.jsonl"))))
+                .poll("");
+        }
+        changed
+    }
+
+    fn subagent_mut(
+        &mut self,
+        tool_use_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> Option<&mut Subagent> {
+        self.subagents.iter_mut().rev().find(|s| {
+            tool_use_id.is_some_and(|id| s.tool_use_id == id)
+                || agent_id.is_some_and(|id| s.agent_id.as_deref() == Some(id))
+        })
+    }
+
+    /// `<task-notification>`: a background subagent finished, failed or was stopped.
+    fn notification(&mut self, text: &str, at: Option<u64>) {
+        if !text.contains("<task-notification>") {
+            return;
+        }
+        let status = match tag(text, "status").as_deref() {
+            Some("completed") => SubStatus::Done,
+            Some("failed") => SubStatus::Failed,
+            Some("killed" | "stopped" | "cancelled") => SubStatus::Killed,
+            _ => return,
+        };
+        let task = tag(text, "task-id");
+        let tool_use = tag(text, "tool-use-id");
+        let result = tag(text, "result").or_else(|| tag(text, "summary"));
+        if let Some(sub) = self.subagent_mut(tool_use.as_deref(), task.as_deref()) {
+            if sub.agent_id.is_none() {
+                sub.agent_id = task;
+            }
+            sub.status = status;
+            sub.ended_ms = at.or(sub.ended_ms);
+            if let Some(result) = result {
+                sub.result = Some(clip(&result, 300));
+            }
+        }
+    }
+
+    fn subagent_events(&mut self, value: &Value) {
+        let at = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(crate::usage::parse_rfc3339_ms);
+        let content = value.pointer("/message/content");
+        match value.get("type").and_then(Value::as_str) {
+            Some("assistant") => {
+                for block in content.and_then(Value::as_array).into_iter().flatten() {
+                    let is_agent = block.get("type").and_then(Value::as_str) == Some("tool_use")
+                        && matches!(
+                            block.get("name").and_then(Value::as_str),
+                            Some("Agent" | "Task")
+                        );
+                    let Some(id) = block.get("id").and_then(Value::as_str).filter(|_| is_agent)
+                    else {
+                        continue;
+                    };
+                    if self.subagents.iter().any(|s| s.tool_use_id == id) {
+                        continue;
+                    }
+                    let input = |k: &str| {
+                        block
+                            .pointer(&format!("/input/{k}"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    let agent_type = Some(input("subagent_type"))
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or_else(|| "general-purpose".into());
+                    self.subagents.push(Subagent {
+                        tool_use_id: id.to_string(),
+                        agent_id: None,
+                        description: input("description"),
+                        agent_type,
+                        prompt: input("prompt"),
+                        started_ms: at,
+                        ended_ms: None,
+                        status: SubStatus::Running,
+                        result: None,
+                        cost_usd: None,
+                        total_tokens: 0,
+                        model: None,
+                    });
+                }
+            }
+            Some("user") => {
+                if let Some(text) = content.and_then(Value::as_str) {
+                    self.notification(text, at);
+                    return;
+                }
+                let outcome = value.get("toolUseResult");
+                for block in content.and_then(Value::as_array).into_iter().flatten() {
+                    if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                        continue;
+                    }
+                    let tool_use = block.get("tool_use_id").and_then(Value::as_str);
+                    let failed = block.get("is_error").and_then(Value::as_bool) == Some(true);
+                    let text = match block.get("content") {
+                        Some(Value::String(s)) => Some(s.clone()),
+                        Some(Value::Array(parts)) => parts
+                            .iter()
+                            .find_map(|p| p.get("text").and_then(Value::as_str).map(String::from)),
+                        _ => None,
+                    };
+                    let Some(sub) = self.subagent_mut(tool_use, None) else {
+                        continue;
+                    };
+                    if let Some(agent) = outcome
+                        .and_then(|o| o.get("agentId"))
+                        .and_then(Value::as_str)
+                    {
+                        sub.agent_id = Some(agent.to_string());
+                    }
+                    let launched = outcome
+                        .and_then(|o| o.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("async_launched");
+                    if !launched {
+                        sub.status = if failed {
+                            SubStatus::Failed
+                        } else {
+                            SubStatus::Done
+                        };
+                        sub.ended_ms = at;
+                        sub.result = text.map(|t| clip(&t, 300));
+                    }
+                }
+            }
+            Some("queue-operation") => {
+                if value.get("operation").and_then(Value::as_str) == Some("enqueue") {
+                    if let Some(text) = value.get("content").and_then(Value::as_str) {
+                        self.notification(text, at);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Reads what was appended here and in the subagents' transcripts; true when anything was.
     fn poll(&mut self, cwd: &str) -> bool {
+        let main = self.read_appended(cwd);
+        self.poll_subagents() || main
+    }
+
+    fn read_appended(&mut self, cwd: &str) -> bool {
         if self.path.is_none() {
             self.path = transcript_path(cwd, &self.session_id);
         }
@@ -262,6 +469,7 @@ impl Tracker {
         let Ok(value) = serde_json::from_slice::<Value>(line) else {
             return;
         };
+        self.subagent_events(&value);
         match value.get("type").and_then(Value::as_str) {
             Some("ai-title") => {
                 if let Some(title) = value
@@ -327,7 +535,33 @@ impl Tracker {
                 dominant = Some((usage.output, model));
             }
         }
+        let subagents: Vec<Subagent> = self
+            .subagents
+            .iter()
+            .map(|sub| {
+                let mut sub = sub.clone();
+                if let Some(t) = sub
+                    .agent_id
+                    .as_ref()
+                    .and_then(|id| self.sub_trackers.get(id))
+                {
+                    let s = t.stats("");
+                    sub.cost_usd = s.cost_usd;
+                    sub.total_tokens = s.total_tokens;
+                    sub.model = s.model;
+                }
+                sub
+            })
+            .collect();
+        // A session's cost includes what its subagents spent.
+        for sub in &subagents {
+            total += sub.total_tokens;
+            if let Some(c) = sub.cost_usd {
+                cost = Some(cost.unwrap_or(0.0) + c);
+            }
+        }
         SessionStats {
+            subagents,
             title: self
                 .ai_title
                 .clone()
@@ -339,6 +573,25 @@ impl Tracker {
             cwd: cwd.to_string(),
         }
     }
+}
+
+/// `text` on one line, at most `max` characters.
+fn clip(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// The text inside `<name>…</name>`.
+fn tag(text: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&format!("</{name}>"))? + start;
+    Some(text[start..end].trim().to_string()).filter(|t| !t.is_empty())
 }
 
 fn first_text(value: &Value) -> Option<String> {
@@ -501,6 +754,55 @@ mod tests {
         assert_eq!(tracker.stats("").title.as_deref(), Some("Login quebrado"));
         assert!(!tracker.poll(""));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subagents_from_the_session_transcript_with_their_own_cost() {
+        let root = std::env::temp_dir().join(format!("alethe-subagents-{}", uuid::Uuid::new_v4()));
+        let subs = root.join("sess").join("subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        let main = root.join("sess.jsonl");
+        let lines = [
+            r#"{"type":"assistant","timestamp":"2026-11-25T10:00:00Z","message":{"content":[{"type":"tool_use","id":"tu1","name":"Agent","input":{"description":"Revisar o parser","prompt":"Leia tudo","subagent_type":"Explore"}},{"type":"tool_use","id":"tu2","name":"Agent","input":{"description":"Rodar testes","prompt":"cargo test","run_in_background":true}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-11-25T10:00:30Z","toolUseResult":{"status":"completed","agentId":"aaa"},"message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":[{"type":"text","text":"Tudo certo\ncom o parser"}]}]}}"#,
+            r#"{"type":"user","timestamp":"2026-11-25T10:00:31Z","toolUseResult":{"status":"async_launched","agentId":"bbb"},"message":{"content":[{"type":"tool_result","tool_use_id":"tu2","content":"launched"}]}}"#,
+        ];
+        std::fs::write(&main, lines.join("\n") + "\n").unwrap();
+        let usage = r#"{"input_tokens":1000000,"output_tokens":0}"#;
+        std::fs::write(
+            subs.join("agent-aaa.jsonl"),
+            format!("{{\"type\":\"assistant\",\"message\":{{\"id\":\"x\",\"model\":\"claude-haiku-5-5\",\"usage\":{usage}}}}}\n"),
+        )
+        .unwrap();
+
+        let mut tracker = Tracker::at(main.clone());
+        tracker.session_id = "sess".into();
+        assert!(tracker.poll(""));
+        let stats = tracker.stats("");
+        assert_eq!(stats.subagents.len(), 2);
+        let review = &stats.subagents[0];
+        assert_eq!(review.status, SubStatus::Done);
+        assert_eq!(review.agent_type, "Explore");
+        assert_eq!(review.result.as_deref(), Some("Tudo certo com o parser"));
+        assert_eq!(
+            review.ended_ms.unwrap() - review.started_ms.unwrap(),
+            30_000
+        );
+        assert!((review.cost_usd.unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!(stats.subagents[1].status, SubStatus::Running);
+        // The session's cost includes the subagent's.
+        assert!((stats.cost_usd.unwrap() - 1.0).abs() < 1e-9);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&main)
+            .unwrap();
+        writeln!(file, r#"{{"type":"queue-operation","operation":"enqueue","timestamp":"2026-11-25T10:02:00Z","content":"<task-notification>\n<task-id>bbb</task-id>\n<tool-use-id>tu2</tool-use-id>\n<status>killed</status>\n<summary>Agent stopped</summary>\n</task-notification>"}}"#).unwrap();
+        assert!(tracker.poll(""));
+        let tests = &tracker.stats("").subagents[1];
+        assert_eq!(tests.status, SubStatus::Killed);
+        assert_eq!(tests.agent_id.as_deref(), Some("bbb"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

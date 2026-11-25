@@ -412,7 +412,7 @@ fn parse_codex(body: &Value) -> Result<CodexUsage, String> {
 // ----------------------------------------------------------------- time
 
 /// `2026-09-24T02:59:59.123+00:00` → epoch ms. Enough RFC 3339 for API timestamps.
-fn parse_rfc3339_ms(text: &str) -> Option<u64> {
+pub(crate) fn parse_rfc3339_ms(text: &str) -> Option<u64> {
     let text = text.trim();
     let num = |s: &str| s.parse::<i64>().ok();
     let (date, rest) = text.split_once(['T', ' '])?;

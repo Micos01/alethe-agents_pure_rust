@@ -65,6 +65,9 @@ struct Job {
     superseded_by: Option<String>,
     has_diff: bool,
     summary: String,
+    /// One of Claude's own subagents, read from its transcript: Alethe can't stop it.
+    #[serde(skip)]
+    native: bool,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -2642,11 +2645,63 @@ enum PanelIntent {
     Enable,
 }
 
+/// Claude's own subagents as jobs under their tab, the planner (`nativeSubagentJobs`).
+fn native_subagent_jobs(app: &AletheApp) -> Vec<Job> {
+    use crate::transcripts::SubStatus;
+    let now = crate::model::now_ms();
+    app.transcripts
+        .all()
+        .into_iter()
+        .flat_map(|(tab_id, stats)| {
+            stats.subagents.into_iter().map(move |sub| {
+                let seconds = sub.started_ms.map(|start| {
+                    (sub.ended_ms.unwrap_or(now).saturating_sub(start)) as f64 / 1000.0
+                });
+                Job {
+                    id: format!("subagent:{}", sub.tool_use_id),
+                    planner_id: Some(tab_id.clone()),
+                    agent: "claude".into(),
+                    run_id: format!("native-subagents:{tab_id}"),
+                    run_label: Some("Subagents".into()),
+                    spec: if sub.description.is_empty() {
+                        sub.prompt.clone()
+                    } else {
+                        sub.description.clone()
+                    },
+                    cwd: stats.cwd.clone(),
+                    status: match sub.status {
+                        SubStatus::Running => "running",
+                        SubStatus::Done => "done",
+                        SubStatus::Failed => "failed",
+                        SubStatus::Killed => "interrupted",
+                    }
+                    .into(),
+                    outcome: sub.result.clone(),
+                    seconds,
+                    tokens: (sub.total_tokens > 0).then(|| Tokens {
+                        total: Some(TokenCount {
+                            total_tokens: Some(sub.total_tokens as f64),
+                        }),
+                        ..Default::default()
+                    }),
+                    cost_usd: sub.cost_usd,
+                    role: Some(sub.agent_type.clone()),
+                    model: sub.model.clone(),
+                    summary: sub.result.clone().unwrap_or_else(|| sub.prompt.clone()),
+                    native: true,
+                    ..Default::default()
+                }
+            })
+        })
+        .collect()
+}
+
 pub fn agents_panel(app: &mut AletheApp, ui: &mut egui::Ui) {
     let theme = app.theme.clone();
     let lang = app.lang();
     let t = |key: &str| crate::i18n::tr(lang, key);
     super::todos::tab_strip(app, ui);
+    let native = native_subagent_jobs(app);
 
     let enabled = app.feature_enabled("orchestrator");
     if enabled && !app.orchestrator.is_started() {
@@ -2681,6 +2736,7 @@ pub fn agents_panel(app: &mut AletheApp, ui: &mut egui::Ui) {
     let jobs: Vec<&Job> = snapshot
         .jobs
         .iter()
+        .chain(native.iter())
         .filter(|j| j.superseded_by.is_none())
         .filter(|j| !scoped || j.planner_id == planner)
         .collect();
@@ -2885,7 +2941,7 @@ pub fn agents_panel(app: &mut AletheApp, ui: &mut egui::Ui) {
         .hline(ui.max_rect().x_range(), y, Stroke::new(1.0, theme.border));
 
     // ---- body
-    if !enabled || jobs.is_empty() {
+    if jobs.is_empty() {
         ui.add_space(40.0);
         ui.vertical_centered(|ui| {
             ui.label(
@@ -3210,7 +3266,7 @@ fn agent_job_row(
     agent_glyph(ui, theme, Some(&job.agent), icon);
     let text_left = icon.right() + 7.0;
     let mut right = r.right() - 6.0;
-    if job.can_stop() {
+    if job.can_stop() && !job.native {
         let b = Rect::from_center_size(pos2(right - 9.0, top + 8.0), Vec2::splat(18.0));
         let br = ui.interact(
             b,
