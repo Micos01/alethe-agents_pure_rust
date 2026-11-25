@@ -29,6 +29,7 @@ nanoid = "0.4"
 uuid = { version = "1", features = ["v4"] }
 dirs-next = "2"
 arboard = { version = "3", default-features = false }
+ureq = { version = "3", default-features = false, features = ["native-tls", "json"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

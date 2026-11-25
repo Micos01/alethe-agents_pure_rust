@@ -15,6 +15,7 @@ mod storage;
 mod terminal;
 mod theme;
 mod ui;
+mod usage;
 
 use eframe::egui;
 use std::sync::Arc;

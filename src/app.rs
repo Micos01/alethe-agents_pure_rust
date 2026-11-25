@@ -205,6 +205,7 @@ pub struct AletheApp {
     notified_revision: u64,
     notified_blocked: std::collections::HashSet<String>,
     pub memory_mb: Arc<AtomicU64>,
+    pub usage: crate::usage::UsageMonitor,
     pub orchestrator: Arc<crate::orchestrator::Orchestrator>,
     pub boards: HashMap<String, crate::ui::orchestrator::BoardState>,
     pub markdown: HashMap<String, crate::ui::markdown::MarkdownState>,
@@ -342,6 +343,7 @@ impl AletheApp {
             notified_revision: 0,
             notified_blocked: Default::default(),
             memory_mb,
+            usage: crate::usage::UsageMonitor::start(cc.egui_ctx.clone()),
             orchestrator,
             boards: HashMap::new(),
             markdown: HashMap::new(),
@@ -389,6 +391,33 @@ impl AletheApp {
 
     pub fn mark_dirty(&mut self) {
         self.dirty_since.get_or_insert_with(Instant::now);
+    }
+
+    /// `preferences.usageAccess[provider]`: off unless the user turned it on.
+    pub fn usage_access(&self, provider: &str) -> bool {
+        self.data
+            .preferences
+            .extra
+            .get("usageAccess")
+            .and_then(|a| a.get(provider))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub fn set_usage_access(&mut self, provider: &str, on: bool) {
+        let access = self
+            .data
+            .preferences
+            .extra
+            .entry("usageAccess")
+            .or_insert(serde_json::Value::Null);
+        if !access.is_object() {
+            *access = serde_json::json!({
+                "claude": false, "codex": false, "antigravity": false, "kimi": false, "openrouter": false
+            });
+        }
+        access[provider] = serde_json::json!(on);
+        self.mark_dirty();
     }
 
     /// Applies a Pomodoro transition and persists the session.
@@ -884,6 +913,8 @@ impl AletheApp {
     }
 
     pub fn frame_end(&mut self) {
+        self.usage
+            .set_access(self.usage_access("claude"), self.usage_access("codex"));
         self.poll_notifications();
         self.tick_pomodoro();
         let actions: Vec<Action> = self.actions.borrow_mut().drain(..).collect();

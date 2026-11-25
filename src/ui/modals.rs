@@ -436,6 +436,30 @@ fn settings(app: &mut AletheApp, ui: &mut egui::Ui, width: f32, close: &mut bool
                 });
             }
             ui.add_space(6.0);
+            for (provider, key) in [
+                ("claude", "settings.usageClaude"),
+                ("codex", "settings.usageCodex"),
+            ] {
+                let mut on = app.usage_access(provider);
+                if ui
+                    .checkbox(
+                        &mut on,
+                        RichText::new(app.t(key)).font(sans(12.5)).color(theme.fg),
+                    )
+                    .changed()
+                {
+                    app.set_usage_access(provider, on);
+                }
+            }
+            ui.add(
+                egui::Label::new(
+                    RichText::new(app.t("settings.usageHint"))
+                        .font(sans(11.5))
+                        .color(theme.fg_faint),
+                )
+                .wrap(),
+            );
+            ui.add_space(6.0);
             section(ui, &theme, app.t("settings.data"));
             field(ui, &theme, app.t("settings.dataFile"));
             let path = app.storage.projects_path().to_string_lossy().to_string();

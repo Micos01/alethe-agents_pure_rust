@@ -4,7 +4,7 @@ use super::icons;
 use super::widgets::{self, icon_button, icon_button_active, mono, sans};
 use crate::app::{Action, AletheApp, Modal, View};
 use egui::{
-    Align, Align2, CornerRadius, Layout, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
+    Align, Align2, CornerRadius, Layout, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
     ViewportCommand,
 };
 use std::sync::atomic::Ordering;
@@ -138,6 +138,7 @@ pub fn show(app: &mut AletheApp, ui: &mut egui::Ui) {
                 app.show_right = !app.show_right;
             }
             pomodoro_pill(app, ui);
+            usage_pills(app, ui);
             let mb = app.memory_mb.load(Ordering::Relaxed);
             pill(ui, &theme, &format!("{mb} MB"), None);
             let profile = app.storage.index.active_name();
@@ -429,5 +430,167 @@ fn pomodoro_pill(app: &mut AletheApp, ui: &mut egui::Ui) {
             Status::Paused => p.resume(now),
             _ => p.start(None, d, now),
         });
+    }
+}
+
+/// Claude and Codex usage pills (5 h window), with the other windows on hover.
+fn usage_pills(app: &mut AletheApp, ui: &mut egui::Ui) {
+    let theme = app.theme.clone();
+    let lang = app.lang();
+    let t = |key: &str| crate::i18n::tr(lang, key);
+    let now = crate::model::now_ms();
+    let shown = |key: &str| {
+        app.data
+            .preferences
+            .extra
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+    };
+    type Row = (
+        &'static str,
+        f64,
+        bool,
+        Vec<(String, String)>,
+        Option<String>,
+    );
+    let mut rows: Vec<Row> = Vec::new();
+    let fmt = |p: f64| format!("{p:.0}%");
+    // Right to left: Codex first so Claude ends up leftmost, as in the web build.
+    if shown("topbarShowCodexUsage") {
+        let reading = app.usage.codex();
+        if let Some(u) = reading.value {
+            let mut lines = Vec::new();
+            let headline = if u.primary_minutes > 0 {
+                lines.push((t("usage.window5h").to_string(), fmt(u.primary.percent)));
+                lines.push((t("usage.week").to_string(), fmt(u.secondary.percent)));
+                u.primary.percent
+            } else {
+                lines.push((t("usage.week").to_string(), fmt(u.secondary.percent)));
+                u.secondary.percent
+            };
+            lines.push((
+                t("usage.status").to_string(),
+                t(if u.rate_limited {
+                    "usage.limited"
+                } else {
+                    "usage.ok"
+                })
+                .to_string(),
+            ));
+            if !u.plan.is_empty() {
+                lines.push((t("usage.plan").to_string(), u.plan.clone()));
+            }
+            if u.reset_credits > 0 {
+                lines.push((
+                    t("usage.resetCredits").to_string(),
+                    u.reset_credits.to_string(),
+                ));
+            }
+            let reset = crate::usage::reset_in(
+                if u.primary_minutes > 0 {
+                    u.primary.resets_at_ms
+                } else {
+                    u.secondary.resets_at_ms
+                },
+                now,
+            );
+            rows.push(("codex", headline, reading.stale, lines, reset));
+        }
+    }
+    if shown("topbarShowClaudeUsage") {
+        let reading = app.usage.claude();
+        if let Some(u) = reading.value {
+            let mut lines = vec![
+                (t("usage.window5h").to_string(), fmt(u.five_hour.percent)),
+                (t("usage.week").to_string(), fmt(u.seven_day.percent)),
+                (t("usage.opus").to_string(), fmt(u.seven_day_opus.percent)),
+            ];
+            for (model, w) in &u.model_limits {
+                lines.push((
+                    format!("{} ({})", t("usage.week"), model.to_lowercase()),
+                    fmt(w.percent),
+                ));
+            }
+            let reset = crate::usage::reset_in(u.five_hour.resets_at_ms, now);
+            rows.push(("claude", u.five_hour.percent, reading.stale, lines, reset));
+        }
+    }
+    for (agent, percent, stale, lines, reset) in rows {
+        let color = match crate::usage::level(percent) {
+            2 => theme.offline,
+            1 => theme.waiting,
+            _ => theme.working,
+        };
+        let label = format!("{percent:.0}%");
+        let galley = ui.painter().layout_no_wrap(label, mono(11.5), color);
+        let (rect, response) = ui.allocate_exact_size(
+            Vec2::new(8.0 + 13.0 + 5.0 + galley.size().x + 8.0, 24.0),
+            Sense::click(),
+        );
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(6),
+            if response.hovered() {
+                theme.panel_hover
+            } else {
+                theme.bg
+            },
+            Stroke::new(
+                1.0,
+                if stale {
+                    theme.border
+                } else {
+                    color.gamma_multiply(0.45)
+                },
+            ),
+            StrokeKind::Inside,
+        );
+        let icon = Rect::from_center_size(
+            Pos2::new(rect.left() + 8.0 + 6.5, rect.center().y),
+            Vec2::splat(13.0),
+        );
+        if let Some(image) = icons::agent_image(agent, 13.0) {
+            image.paint_at(ui, icon);
+        }
+        ui.painter().galley(
+            Pos2::new(icon.right() + 5.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            if stale { theme.fg_faint } else { color },
+        );
+        let title = crate::agents::info(agent).label;
+        let response = response.on_hover_ui(|ui| {
+            ui.set_min_width(170.0);
+            ui.label(
+                RichText::new(title)
+                    .font(super::widgets::bold(12.5))
+                    .color(theme.fg),
+            );
+            for (name, value) in &lines {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(name).font(sans(12.0)).color(theme.fg_muted));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(value).font(mono(12.0)).color(theme.fg));
+                    });
+                });
+            }
+            if let Some(reset) = &reset {
+                ui.label(
+                    RichText::new(format!("{} · {reset}", t("usage.resetsIn")))
+                        .font(sans(11.0))
+                        .color(theme.fg_faint),
+                );
+            }
+            if stale {
+                ui.label(
+                    RichText::new(t("usage.stale"))
+                        .font(sans(11.0))
+                        .color(theme.waiting),
+                );
+            }
+        });
+        if response.clicked() {
+            app.usage.refresh();
+        }
     }
 }
