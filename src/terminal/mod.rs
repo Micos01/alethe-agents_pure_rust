@@ -2,6 +2,7 @@
 //! `alacritty_terminal` emulator. Replaces `pty.rs` + xterm.js of the web build.
 
 pub mod input;
+pub mod monitor;
 pub mod view;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -139,6 +140,8 @@ pub struct TerminalSession {
     pub pid: Option<u32>,
     /// Scroll position the view last rendered (lines above the live screen).
     pub had_output: Arc<AtomicBool>,
+    /// Agents only: tells when an answer to a submitted prompt is complete.
+    monitor: Option<Arc<Mutex<monitor::CompletionMonitor>>>,
 }
 
 fn rgb(c: crate::theme::Rgba8) -> Rgb {
@@ -213,10 +216,13 @@ impl TerminalSession {
         let exit_code = Arc::new(AtomicI64::new(i64::MIN));
         let last_output_ms = Arc::new(AtomicU64::new(0));
         let had_output = Arc::new(AtomicBool::new(false));
+        let monitor = (!matches!(spec.program_label.as_str(), "shell" | "wsl"))
+            .then(|| Arc::new(Mutex::new(monitor::CompletionMonitor::default())));
 
         // Reader: PTY bytes -> emulator.
         {
             let term = Arc::clone(&term);
+            let monitor = monitor.clone();
             let last_output_ms = Arc::clone(&last_output_ms);
             let had_output = Arc::clone(&had_output);
             let repaint = repaint.clone();
@@ -231,6 +237,11 @@ impl TerminalSession {
                             Ok(n) => {
                                 if let Ok(mut term) = term.lock() {
                                     processor.advance(&mut *term, &buf[..n]);
+                                }
+                                if let Some(monitor) = &monitor {
+                                    if let Ok(mut monitor) = monitor.lock() {
+                                        monitor.handle_output(&buf[..n]);
+                                    }
                                 }
                                 last_output_ms
                                     .store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -277,6 +288,7 @@ impl TerminalSession {
             started_at: Instant::now(),
             pid,
             had_output,
+            monitor,
         });
 
         if let Some(text) = spec.initial_input.filter(|t| !t.trim().is_empty()) {
@@ -312,8 +324,32 @@ impl TerminalSession {
         });
     }
 
+    /// True once per finished answer (see `monitor`). Polled by the app every frame.
+    pub fn take_completion(&self) -> bool {
+        let since_output = self.since_last_output();
+        self.monitor
+            .as_ref()
+            .and_then(|m| m.lock().ok().map(|mut m| m.poll(since_output)))
+            .unwrap_or(false)
+    }
+
+    /// A prompt was submitted and its answer has not been reported yet.
+    pub fn completion_pending(&self) -> bool {
+        !self.is_exited()
+            && self
+                .monitor
+                .as_ref()
+                .and_then(|m| m.lock().ok().map(|m| m.pending()))
+                .unwrap_or(false)
+    }
+
     pub fn write(&self, bytes: &[u8]) {
         *self.last_input.lock().unwrap() = Instant::now();
+        if let Some(monitor) = &self.monitor {
+            if let Ok(mut monitor) = monitor.lock() {
+                monitor.handle_input(bytes);
+            }
+        }
         if let Ok(mut w) = self.shared.writer.lock() {
             let _ = w.write_all(bytes);
             let _ = w.flush();

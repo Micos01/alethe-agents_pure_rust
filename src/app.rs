@@ -187,6 +187,8 @@ pub struct AletheApp {
     applied_theme: String,
     applied_zoom: f32,
     pub toasts: Vec<(String, Instant)>,
+    notified_revision: u64,
+    notified_blocked: std::collections::HashSet<String>,
     pub memory_mb: Arc<AtomicU64>,
     pub orchestrator: Arc<crate::orchestrator::Orchestrator>,
     pub boards: HashMap<String, crate::ui::orchestrator::BoardState>,
@@ -313,6 +315,8 @@ impl AletheApp {
             },
             theme,
             toasts,
+            notified_revision: 0,
+            notified_blocked: Default::default(),
             memory_mb,
             orchestrator,
             boards: HashMap::new(),
@@ -363,8 +367,8 @@ impl AletheApp {
         self.dirty_since.get_or_insert_with(Instant::now);
     }
 
-    /// The focused terminal's active sub-tab id, when that tab is an orchestrator planner.
-    pub fn focused_planner(&self) -> Option<String> {
+    /// The focused terminal's active sub-tab id.
+    pub fn focused_tab(&self) -> Option<String> {
         let focused = self.focused_terminal.as_ref()?;
         let terminal = self
             .data
@@ -377,7 +381,120 @@ impl AletheApp {
             .iter()
             .find(|tab| tab.id == terminal.active_tab_id)
             .or_else(|| terminal.tabs.first())?;
-        self.planner_tabs.contains(&tab.id).then(|| tab.id.clone())
+        Some(tab.id.clone())
+    }
+
+    /// The focused terminal's active sub-tab id, when that tab is an orchestrator planner.
+    pub fn focused_planner(&self) -> Option<String> {
+        self.focused_tab()
+            .filter(|tab| self.planner_tabs.contains(tab))
+    }
+
+    /// `lib/notifications.ts`: a toast while the window is in front (skipped for the terminal
+    /// already on screen), otherwise also an OS notification and a taskbar flash.
+    pub fn notify(&mut self, title: String, body: String, source_tab: Option<&str>) {
+        let in_front = self.ctx.input(|i| {
+            i.viewport().focused.unwrap_or(true) && !i.viewport().minimized.unwrap_or(false)
+        });
+        if in_front {
+            if source_tab.is_none() || self.focused_tab().as_deref() != source_tab {
+                self.toasts
+                    .push((format!("{title}\n{body}"), Instant::now()));
+            }
+            return;
+        }
+        self.toasts
+            .push((format!("{title}\n{body}"), Instant::now()));
+        crate::notify::os_notify(title, body);
+        self.ctx
+            .send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Informational,
+            ));
+    }
+
+    /// Agents that finished answering, and workers that now wait on an approval.
+    fn poll_notifications(&mut self) {
+        let mut done = Vec::new();
+        let mut pending = false;
+        for (tab, session) in &self.sessions {
+            if session.take_completion() {
+                done.push(tab.clone());
+            }
+            pending |= session.completion_pending();
+        }
+        if pending {
+            self.ctx.request_repaint_after(Duration::from_secs(1));
+        }
+        for tab_id in done {
+            let found = self.data.projects.iter().find_map(|p| {
+                p.terminals.iter().find_map(|t| {
+                    t.tabs.iter().find(|tab| tab.id == tab_id).map(|tab| {
+                        (
+                            tab.agent.clone(),
+                            format!("{} · {}", p.name, t.name),
+                            tab.cwd.clone(),
+                        )
+                    })
+                })
+            });
+            let Some((agent, label, cwd)) = found else {
+                continue;
+            };
+            let title = self
+                .t("notif.agentDoneTitle")
+                .replace("{agent}", crate::agents::info(&agent).label);
+            let body = self
+                .t("notif.respondedInPath")
+                .replace("{label}", &label)
+                .replace("{path}", &crate::notify::short_path(&cwd));
+            self.notify(title, body, Some(&tab_id));
+        }
+
+        let revision = self.orchestrator.revision();
+        if revision == self.notified_revision {
+            return;
+        }
+        self.notified_revision = revision;
+        let board = self.orchestrator.board();
+        let mut blocked = std::collections::HashSet::new();
+        let mut fresh = Vec::new();
+        for job in board
+            .get("jobs")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if job.get("status").and_then(serde_json::Value::as_str) != Some("blocked") {
+                continue;
+            }
+            let Some(id) = job.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if !self.notified_blocked.contains(id) {
+                let ask = job.get("pendingApproval");
+                let text = |key: &str| {
+                    ask.and_then(|a| a.get(key))
+                        .and_then(serde_json::Value::as_str)
+                };
+                let detail = text("command")
+                    .or_else(|| text("reason"))
+                    .map(str::to_string)
+                    .or_else(|| {
+                        job.get("spec")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|s| s.lines().map(str::trim).find(|l| !l.is_empty()))
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                fresh.push((id.to_string(), detail));
+            }
+            blocked.insert(id.to_string());
+        }
+        self.notified_blocked = blocked;
+        for (id, detail) in fresh {
+            let title = self.t("notif.approvalTitle").replace("{id}", &id);
+            self.notify(title, detail, None);
+        }
     }
 
     pub fn project(&self, id: &str) -> Option<&Project> {
@@ -700,6 +817,7 @@ impl AletheApp {
     }
 
     pub fn frame_end(&mut self) {
+        self.poll_notifications();
         let actions: Vec<Action> = self.actions.borrow_mut().drain(..).collect();
         for action in actions {
             self.apply(action);

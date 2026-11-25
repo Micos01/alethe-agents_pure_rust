@@ -220,6 +220,9 @@ messages! {
     "agentsPanel.plannerClosed" => "planner fechado", "planner closed";
     "agentsPanel.finished" => "{count} encerrados", "{count} finished";
     "agentsPanel.costTitle" => "Custo informado pelos workers. Workers Claude informam ao fim de cada turno.", "Cost reported by the workers. Claude workers report it at the end of each turn.";
+    "notif.agentDoneTitle" => "{agent} terminou", "{agent} finished";
+    "notif.respondedInPath" => "{label} respondeu em {path}.", "{label} responded in {path}.";
+    "notif.approvalTitle" => "{id} aguarda aprovação", "{id} is waiting for approval";
     "settings.features" => "Recursos", "Features";
     "settings.orchestrator" => "Orquestrador (MCP)", "Orchestrator (MCP)";
     "settings.orchestratorHint" => "Terminais Claude e Codex recebem o servidor MCP da Alethe e podem delegar tarefas a workers. Vale para terminais abertos depois de ligar.", "Claude and Codex terminals get Alethe's MCP server and can delegate work to workers. Applies to terminals opened after turning it on.";
