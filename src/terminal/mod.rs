@@ -437,6 +437,13 @@ impl TerminalSession {
         }
     }
 
+    /// The last line submitted from the keyboard (agents only), and when.
+    pub fn last_submit(&self) -> Option<(Instant, String)> {
+        self.monitor
+            .as_ref()
+            .and_then(|m| m.lock().ok().and_then(|m| m.last_submit()))
+    }
+
     pub fn is_exited(&self) -> bool {
         self.exited.load(Ordering::Relaxed)
     }

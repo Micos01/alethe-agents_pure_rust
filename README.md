@@ -39,7 +39,7 @@ Preferências → "Reimportar do Alethe" copia de novo.
 | `terminal/` | `alacritty_terminal` + `portable-pty`; renderização, seleção, scrollback, mouse reporting, bracketed paste. |
 | `theme/` | Os 17 temas de interface e as paletas de terminal, gerados de `theme.css`/`xtermThemes.ts` por `tools/gen_themes.py`. |
 | `ui/` | Titlebar, sidebar, Home, workspace, tarefas + Pomodoro, modais, quadro e painel de agentes (`orchestrator.rs`), controle de versão (`git_panel.rs`), servidores MCP (`mcp.rs`) e pane de Markdown (`markdown.rs`). |
-| `transcripts.rs` | Título da conversa, custo por terminal e subagentes do Claude, lidos de forma incremental dos transcripts. |
+| `transcripts.rs`, `codex_sessions.rs` | Título da conversa, custo por terminal e subagentes do Claude, lidos de forma incremental dos transcripts; no Codex, título e tokens do rollout, que é descoberto e associado à aba (o id fica salvo para o resume). |
 | `usage.rs`, `resources.rs` | Uso do Claude/Codex na barra de título (opt-in) e monitor de memória com suspender grupo/projeto. |
 | `storage.rs`, `model.rs` | Leitura/escrita atômica de `projects.json`, importação do Tauri. |
 
@@ -61,7 +61,7 @@ Medido no Windows 11 (build release, só o processo do app, sem contar shells/ag
 
 ## O que ainda não foi portado
 
-Voz, plugins, catálogo de skills do Alethe, título/custo de abas Codex, panes de navegador/arquivo/imagem/vídeo/diff, sincronização na nuvem e acesso
+Voz, plugins, catálogo de skills do Alethe, panes de navegador/arquivo/imagem/vídeo/diff, sincronização na nuvem e acesso
 remoto. Panes desses tipos aparecem com um aviso, e os dados deles são mantidos.
 
 No orquestrador ainda faltam os shells abertos pelo planner e as arestas animadas; no Markdown, diagramas Mermaid

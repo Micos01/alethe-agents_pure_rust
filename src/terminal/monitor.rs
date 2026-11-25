@@ -24,6 +24,8 @@ pub struct CompletionMonitor {
     prompt: String,
     submitted_at: Instant,
     output_chars: usize,
+    /// The last line submitted, and when.
+    last_submit: Option<(Instant, String)>,
 }
 
 impl Default for CompletionMonitor {
@@ -34,6 +36,7 @@ impl Default for CompletionMonitor {
             prompt: String::new(),
             submitted_at: Instant::now(),
             output_chars: 0,
+            last_submit: None,
         }
     }
 }
@@ -93,12 +96,17 @@ impl CompletionMonitor {
     }
 
     /// Whether a completion may still come, so the app keeps polling.
+    pub fn last_submit(&self) -> Option<(Instant, String)> {
+        self.last_submit.clone()
+    }
+
     pub fn pending(&self) -> bool {
         self.state != State::Idle
     }
 
     fn arm(&mut self, prompt: String) {
         self.state = State::Armed;
+        self.last_submit = Some((Instant::now(), prompt.clone()));
         self.prompt = prompt;
         self.submitted_at = Instant::now();
         self.output_chars = 0;

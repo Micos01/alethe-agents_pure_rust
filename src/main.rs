@@ -5,6 +5,7 @@
 mod agents;
 mod app;
 mod backend;
+mod codex_sessions;
 mod i18n;
 mod launch;
 mod model;

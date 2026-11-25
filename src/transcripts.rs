@@ -5,6 +5,10 @@
 //! `~/.claude/projects/<encoded cwd>/<session id>.jsonl`. A background thread follows the running
 //! tabs every 4 s and reads only what was appended since the last pass: a long session is read
 //! once, not once per poll.
+//!
+//! Codex tabs are followed the same way through their rollout (`~/.codex/sessions/.../rollout-*-<id>.jsonl`):
+//! the first prompt is the title, and `token_count` events carry the running token total. Codex
+//! has no price table upstream, so it shows tokens, not dollars.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -25,6 +29,8 @@ pub struct Live {
     pub tab_id: String,
     pub cwd: String,
     pub session_id: String,
+    /// A Codex rollout instead of a Claude transcript.
+    pub codex: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -70,6 +76,8 @@ pub struct Subagent {
 pub struct TranscriptWatcher {
     live: Arc<Mutex<Vec<Live>>>,
     stats: Arc<Mutex<HashMap<String, SessionStats>>>,
+    /// Codex rollouts created since the app started, not yet matched to a tab.
+    rollouts: Arc<Mutex<Vec<crate::codex_sessions::Rollout>>>,
 }
 
 impl TranscriptWatcher {
@@ -77,14 +85,24 @@ impl TranscriptWatcher {
         let watcher = Self {
             live: Arc::default(),
             stats: Arc::default(),
+            rollouts: Arc::default(),
         };
         let live = Arc::clone(&watcher.live);
         let stats = Arc::clone(&watcher.stats);
+        let rollouts = Arc::clone(&watcher.rollouts);
         let _ = std::thread::Builder::new()
             .name("transcripts".into())
             .spawn(move || {
                 let mut trackers: HashMap<String, Tracker> = HashMap::new();
+                let mut scanner = crate::codex_sessions::RolloutScanner::new(
+                    crate::codex_sessions::sessions_dir(),
+                );
                 loop {
+                    let fresh = scanner.poll();
+                    if !fresh.is_empty() {
+                        rollouts.lock().unwrap().extend(fresh);
+                        ctx.request_repaint();
+                    }
                     let tabs = live.lock().unwrap().clone();
                     trackers.retain(|id, t| {
                         tabs.iter()
@@ -92,9 +110,13 @@ impl TranscriptWatcher {
                     });
                     let mut changed = false;
                     for tab in &tabs {
-                        let tracker = trackers
-                            .entry(tab.tab_id.clone())
-                            .or_insert_with(|| Tracker::new(&tab.session_id));
+                        let tracker =
+                            trackers
+                                .entry(tab.tab_id.clone())
+                                .or_insert_with(|| Tracker {
+                                    codex: tab.codex,
+                                    ..Tracker::new(&tab.session_id)
+                                });
                         changed |= tracker.poll(&tab.cwd);
                     }
                     let next: HashMap<String, SessionStats> = tabs
@@ -123,6 +145,11 @@ impl TranscriptWatcher {
         if *live != tabs {
             *live = tabs;
         }
+    }
+
+    /// New Codex rollouts, each handed out once.
+    pub fn take_rollouts(&self) -> Vec<crate::codex_sessions::Rollout> {
+        std::mem::take(&mut *self.rollouts.lock().unwrap())
     }
 
     pub fn stats(&self, tab_id: &str) -> Option<SessionStats> {
@@ -228,6 +255,11 @@ struct Tracker {
     subagents: Vec<Subagent>,
     /// Each subagent's own transcript, by agent id.
     sub_trackers: HashMap<String, Tracker>,
+    codex: bool,
+    /// The model of the latest Codex turn.
+    codex_model: Option<String>,
+    /// When a Codex rollout was last searched for (the search walks the day folders).
+    looked_up: Option<std::time::Instant>,
 }
 
 impl Tracker {
@@ -242,6 +274,9 @@ impl Tracker {
             last_message: None,
             subagents: Vec::new(),
             sub_trackers: HashMap::new(),
+            codex: false,
+            codex_model: None,
+            looked_up: None,
         }
     }
 
@@ -421,7 +456,16 @@ impl Tracker {
     }
 
     fn read_appended(&mut self, cwd: &str) -> bool {
-        if self.path.is_none() {
+        if self.path.is_none() && self.codex {
+            if self
+                .looked_up
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
+            {
+                self.looked_up = Some(std::time::Instant::now());
+                self.path = crate::codex_sessions::sessions_dir()
+                    .and_then(|root| crate::codex_sessions::find_rollout(&root, &self.session_id));
+            }
+        } else if self.path.is_none() {
             self.path = transcript_path(cwd, &self.session_id);
         }
         let Some(path) = self.path.clone() else {
@@ -434,6 +478,7 @@ impl Tracker {
             // Rewritten from scratch: start over.
             *self = Self {
                 path: Some(path.clone()),
+                codex: self.codex,
                 ..Self::new(&self.session_id)
             };
         }
@@ -469,6 +514,10 @@ impl Tracker {
         let Ok(value) = serde_json::from_slice::<Value>(line) else {
             return;
         };
+        if self.codex {
+            self.ingest_codex(&value);
+            return;
+        }
         self.subagent_events(&value);
         match value.get("type").and_then(Value::as_str) {
             Some("ai-title") => {
@@ -520,6 +569,66 @@ impl Tracker {
             .or_default()
             .add(usage, 1);
         self.last_message = Some((id, model, usage));
+    }
+
+    /// One rollout line: `turn_context` names the model, `event_msg` carries the user's prompts
+    /// and the cumulative `token_count`.
+    fn ingest_codex(&mut self, value: &Value) {
+        let payload = value.get("payload");
+        let text = |key: &str| payload.and_then(|p| p.get(key)).and_then(Value::as_str);
+        match value.get("type").and_then(Value::as_str) {
+            Some("turn_context") => {
+                if let Some(model) = text("model").filter(|m| !m.is_empty()) {
+                    self.codex_model = Some(model.to_string());
+                }
+            }
+            Some("event_msg") => match text("type") {
+                Some("user_message") if self.first_prompt.is_none() => {
+                    self.first_prompt = text("message")
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty() && !t.starts_with('<'));
+                }
+                // Newer Codex: the prompt is a completed `UserMessage` item.
+                Some("item_completed") if self.first_prompt.is_none() => {
+                    let item = payload.and_then(|p| p.get("item"));
+                    if item.and_then(|i| i.get("type")).and_then(Value::as_str)
+                        == Some("UserMessage")
+                    {
+                        self.first_prompt = item
+                            .and_then(|i| i.get("content"))
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|c| c.get("text").and_then(Value::as_str))
+                            .map(str::trim)
+                            .find(|t| !t.is_empty() && !t.starts_with('<'))
+                            .map(str::to_string);
+                    }
+                }
+                Some("token_count") => {
+                    let Some(total) = payload
+                        .and_then(|p| p.get("info"))
+                        .and_then(|i| i.get("total_token_usage"))
+                    else {
+                        return;
+                    };
+                    let u = |k: &str| total.get(k).and_then(Value::as_u64).unwrap_or(0);
+                    // `input_tokens` includes the cached part.
+                    let cached = u("cached_input_tokens");
+                    let usage = Usage {
+                        input: u("input_tokens").saturating_sub(cached),
+                        output: u("output_tokens"),
+                        cache_read: cached,
+                        ..Default::default()
+                    };
+                    let model = self.codex_model.clone().unwrap_or_else(|| "codex".into());
+                    self.by_model.clear();
+                    self.by_model.insert(model, usage);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
     }
 
     fn stats(&self, cwd: &str) -> SessionStats {
@@ -803,6 +912,37 @@ mod tests {
         assert_eq!(tests.status, SubStatus::Killed);
         assert_eq!(tests.agent_id.as_deref(), Some("bbb"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_rollout_gives_title_model_and_cumulative_tokens() {
+        let dir = std::env::temp_dir().join(format!("alethe-codex-tr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-11-25T10-00-00-abc.jsonl");
+        let lines = [
+            r#"{"type":"session_meta","payload":{"id":"abc","cwd":"/r","source":"cli"}}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-5-codex"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"text","text":"oi"}]}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"text","text":"  Corrige o parser  "}]}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":50}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"e os testes"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3000,"cached_input_tokens":2000,"output_tokens":200}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let mut tracker = Tracker {
+            codex: true,
+            ..Tracker::at(path.clone())
+        };
+        assert!(tracker.poll("/r"));
+        let stats = tracker.stats("/r");
+        assert_eq!(stats.title.as_deref(), Some("Corrige o parser"));
+        assert_eq!(stats.model.as_deref(), Some("gpt-5-codex"));
+        // The totals are cumulative: the last one wins, not the sum.
+        assert_eq!(stats.total_tokens, 3200);
+        assert_eq!(stats.cost_usd, None);
+        assert!(stats.subagents.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

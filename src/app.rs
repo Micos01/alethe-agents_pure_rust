@@ -205,6 +205,8 @@ pub struct AletheApp {
     pub planner_tabs: std::collections::HashSet<String>,
     pub agents_panel: crate::ui::orchestrator::AgentsPanelState,
     pub mcp_panel: crate::ui::mcp::McpPanelState,
+    /// When each Codex tab last took a rollout (a later `/new` expects another).
+    codex_adopted: HashMap<String, Instant>,
     pub sidebar_search: String,
     pub sidebar_tab: SidebarTab,
     pub git_panel: crate::ui::git_panel::GitPanel,
@@ -334,6 +336,7 @@ impl AletheApp {
             planner_tabs: Default::default(),
             agents_panel: Default::default(),
             mcp_panel: Default::default(),
+            codex_adopted: HashMap::new(),
             sidebar_search: String::new(),
             // `ALETHE_NATIVE_SMOKE=@git` opens on the Source Control tab.
             sidebar_tab: if std::env::var("ALETHE_NATIVE_SMOKE").as_deref() == Ok("@git") {
@@ -427,6 +430,7 @@ impl AletheApp {
             return;
         }
         self.transcripts_fed = Some(Instant::now());
+        self.adopt_codex_rollouts();
         self.resources.set_roots(
             self.sessions
                 .iter()
@@ -441,7 +445,8 @@ impl AletheApp {
                     let Some(session_id) = tab.session_id.as_deref() else {
                         continue;
                     };
-                    if tab.agent != "claude" || !self.sessions.contains_key(&tab.id) {
+                    let codex = tab.agent == "codex";
+                    if !(tab.agent == "claude" || codex) || !self.sessions.contains_key(&tab.id) {
                         continue;
                     }
                     let cwd = [&tab.cwd, &terminal.cwd]
@@ -453,11 +458,77 @@ impl AletheApp {
                         tab_id: tab.id.clone(),
                         cwd,
                         session_id: session_id.to_string(),
+                        codex,
                     });
                 }
             }
         }
         self.transcripts.set_live(live);
+    }
+
+    /// Gives each new Codex rollout to the tab that started it (`trackCodexRollout`); the id is
+    /// saved on the tab, so a restart resumes that conversation.
+    fn adopt_codex_rollouts(&mut self) {
+        let rollouts = self.transcripts.take_rollouts();
+        if rollouts.is_empty() {
+            return;
+        }
+        let now = crate::model::now_ms();
+        let wall = |at: Instant| now.saturating_sub(at.elapsed().as_millis() as u64);
+        let mut panes = Vec::new();
+        for project in &self.data.projects {
+            for terminal in &project.terminals {
+                for tab in terminal.tabs.iter().filter(|t| t.agent == "codex") {
+                    let Some(session) = self.sessions.get(&tab.id) else {
+                        continue;
+                    };
+                    if session.is_exited() {
+                        continue;
+                    }
+                    let submit = session.last_submit();
+                    let adopted = self.codex_adopted.get(&tab.id).copied();
+                    let expects_new = submit.as_ref().is_some_and(|(at, line)| {
+                        crate::codex_sessions::is_new_conversation(line)
+                            && adopted.is_none_or(|a| *at > a)
+                    });
+                    let cwd = [&tab.cwd, &terminal.cwd]
+                        .into_iter()
+                        .find(|c| !c.trim().is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| project.cwd());
+                    panes.push(crate::codex_sessions::Pane {
+                        tab_id: tab.id.clone(),
+                        cwd,
+                        session_id: tab.session_id.clone().filter(|s| !s.is_empty()),
+                        spawned_ms: wall(session.started_at),
+                        last_submit_ms: submit.map(|(at, _)| wall(at)),
+                        expects_new,
+                    });
+                }
+            }
+        }
+        for rollout in rollouts {
+            let Some(tab_id) =
+                crate::codex_sessions::pick_pane(&panes, &rollout, now).map(|p| p.tab_id.clone())
+            else {
+                continue;
+            };
+            if let Some(pane) = panes.iter_mut().find(|p| p.tab_id == tab_id) {
+                pane.session_id = Some(rollout.id.clone());
+                pane.expects_new = false;
+            }
+            self.codex_adopted.insert(tab_id.clone(), Instant::now());
+            for project in &mut self.data.projects {
+                for terminal in &mut project.terminals {
+                    for tab in &mut terminal.tabs {
+                        if tab.id == tab_id {
+                            tab.session_id = Some(rollout.id.clone());
+                        }
+                    }
+                }
+            }
+            self.mark_dirty();
+        }
     }
 
     pub fn find_tab(&self, tab_id: &str) -> Option<&crate::model::SubTab> {
