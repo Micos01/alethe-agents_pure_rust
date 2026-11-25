@@ -20,6 +20,7 @@ pub fn tab_strip(app: &mut AletheApp, ui: &mut egui::Ui) {
             icons::TYPE_HIERARCHY,
             app.t("agentsPanel.title"),
         ),
+        (RightTab::Mcp, icons::PLUG, "MCP"),
     ];
     egui::Frame::new()
         .inner_margin(Margin::symmetric(10, 8))

@@ -33,12 +33,14 @@ Preferências → "Reimportar do Alethe" copia de novo.
 
 | Módulo | O que faz |
 |---|---|
-| `backend/` | `child_env`, `cli_resolver`, `orchestrator_core` (+ `rules`, `shells`) e `git_control` copiados do backend Tauri (só os wrappers `#[tauri::command]` foram removidos); `process` porta o kill da árvore de processos e o Job Object que mata os terminais junto com o app. |
+| `backend/` | `child_env`, `cli_resolver`, `orchestrator_core` (+ `rules`, `shells`), `git_control` e `mcp_model`/`mcp_agents`/`mcp_store` copiados do backend Tauri (só os wrappers `#[tauri::command]` foram removidos); `process` porta o kill da árvore de processos e o Job Object que mata os terminais junto com o app. |
 | `orchestrator.rs` | Servidor MCP local (HTTP em 127.0.0.1, com token) que liga os planners Claude/Codex ao core do orquestrador. Só sobe quando o recurso está ligado e um quadro ou planner é aberto. |
 | `launch.rs`, `agents.rs` | Port de `buildAgentLaunch`: `--session-id`/`--resume` do Claude, `resume` do Codex, flags de modo YOLO etc. |
 | `terminal/` | `alacritty_terminal` + `portable-pty`; renderização, seleção, scrollback, mouse reporting, bracketed paste. |
 | `theme/` | Os 17 temas de interface e as paletas de terminal, gerados de `theme.css`/`xtermThemes.ts` por `tools/gen_themes.py`. |
-| `ui/` | Titlebar, sidebar, Home, workspace, tarefas, modais, quadro de orquestração (`orchestrator.rs`), controle de versão (`git_panel.rs`) e pane de Markdown (`markdown.rs`). |
+| `ui/` | Titlebar, sidebar, Home, workspace, tarefas + Pomodoro, modais, quadro e painel de agentes (`orchestrator.rs`), controle de versão (`git_panel.rs`), servidores MCP (`mcp.rs`) e pane de Markdown (`markdown.rs`). |
+| `transcripts.rs` | Título da conversa, custo por terminal e subagentes do Claude, lidos de forma incremental dos transcripts. |
+| `usage.rs`, `resources.rs` | Uso do Claude/Codex na barra de título (opt-in) e monitor de memória com suspender grupo/projeto. |
 | `storage.rs`, `model.rs` | Leitura/escrita atômica de `projects.json`, importação do Tauri. |
 
 ### Escolhas para economizar memória
@@ -59,7 +61,7 @@ Medido no Windows 11 (build release, só o processo do app, sem contar shells/ag
 
 ## O que ainda não foi portado
 
-Voz, plugins, estatísticas de uso, panes de navegador/arquivo/imagem/vídeo/diff, sincronização na nuvem e acesso
+Voz, plugins, skills no painel MCP, health check dos servidores MCP, título/custo de abas Codex, panes de navegador/arquivo/imagem/vídeo/diff, sincronização na nuvem e acesso
 remoto. Panes desses tipos aparecem com um aviso, e os dados deles são mantidos.
 
 No orquestrador ainda faltam os shells abertos pelo planner e as arestas animadas; no Markdown, diagramas Mermaid

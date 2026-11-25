@@ -85,3 +85,5 @@ pub const PAUSE: &str = "\u{f04c}";
 pub const COFFEE: &str = "\u{f0f4}";
 pub const TIMER: &str = "\u{f017}";
 pub const RESET: &str = "\u{f0e2}";
+pub const PLUG: &str = "\u{f1e6}";
+pub const ARROW_LEFT: &str = "\u{ea9b}";

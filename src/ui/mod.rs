@@ -5,6 +5,7 @@ pub mod git_panel;
 pub mod home;
 pub mod icons;
 pub mod markdown;
+pub mod mcp;
 pub mod modals;
 pub mod orchestrator;
 pub mod sidebar;
@@ -59,6 +60,7 @@ pub fn root(app: &mut AletheApp, ui: &mut egui::Ui) {
             .show(ui, |ui| match app.right_tab {
                 crate::app::RightTab::Todos => todos::show(app, ui),
                 crate::app::RightTab::Agents => orchestrator::agents_panel(app, ui),
+                crate::app::RightTab::Mcp => mcp::panel(app, ui),
             });
     }
 

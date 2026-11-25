@@ -26,6 +26,7 @@ pub enum View {
 pub enum RightTab {
     Todos,
     Agents,
+    Mcp,
 }
 
 /// Which panel the left sidebar shows below its switcher.
@@ -203,6 +204,7 @@ pub struct AletheApp {
     /// Sub-tab ids whose agent was launched with the orchestrator tools (a job's `plannerId`).
     pub planner_tabs: std::collections::HashSet<String>,
     pub agents_panel: crate::ui::orchestrator::AgentsPanelState,
+    pub mcp_panel: crate::ui::mcp::McpPanelState,
     pub sidebar_search: String,
     pub sidebar_tab: SidebarTab,
     pub git_panel: crate::ui::git_panel::GitPanel,
@@ -267,6 +269,7 @@ impl AletheApp {
             .map(|p| p.cwd())
             .unwrap_or_else(crate::storage::home_dir);
 
+        crate::backend::mcp_store::set_backup_dir(&storage.profile_dir());
         let memory_mb = Arc::new(AtomicU64::new(0));
         let resources =
             crate::resources::ResourceMonitor::start(Arc::clone(&memory_mb), cc.egui_ctx.clone());
@@ -318,18 +321,19 @@ impl AletheApp {
             focus_request: None,
             maximized: None,
             show_sidebar: true,
-            // `ALETHE_NATIVE_SMOKE=@agents` / `@todo` open with that right panel showing.
+            // `ALETHE_NATIVE_SMOKE=@agents` / `@todo` / `@mcp` open with that right panel showing.
             show_right: matches!(
                 std::env::var("ALETHE_NATIVE_SMOKE").as_deref(),
-                Ok("@agents" | "@todo")
+                Ok("@agents" | "@todo" | "@mcp")
             ),
-            right_tab: if std::env::var("ALETHE_NATIVE_SMOKE").as_deref() == Ok("@agents") {
-                RightTab::Agents
-            } else {
-                RightTab::Todos
+            right_tab: match std::env::var("ALETHE_NATIVE_SMOKE").as_deref() {
+                Ok("@agents") => RightTab::Agents,
+                Ok("@mcp") => RightTab::Mcp,
+                _ => RightTab::Todos,
             },
             planner_tabs: Default::default(),
             agents_panel: Default::default(),
+            mcp_panel: Default::default(),
             sidebar_search: String::new(),
             // `ALETHE_NATIVE_SMOKE=@git` opens on the Source Control tab.
             sidebar_tab: if std::env::var("ALETHE_NATIVE_SMOKE").as_deref() == Ok("@git") {
