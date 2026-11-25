@@ -103,8 +103,23 @@ impl Job {
             _ => Lane::Finished,
         }
     }
+    /// The card's name: the worker id, or a native subagent's description (its id is a
+    /// `toolu_…` call id).
+    fn label(&self) -> String {
+        if !self.native {
+            return self.id.clone();
+        }
+        let text = self.spec.lines().next().unwrap_or_default().trim();
+        match text.char_indices().nth(32) {
+            Some((cut, _)) => format!("{}…", &text[..cut]),
+            None if text.is_empty() => self.id.clone(),
+            None => text.to_string(),
+        }
+    }
+
+    /// Claude's own subagents run inside its process: the core can't stop them.
     fn can_stop(&self) -> bool {
-        matches!(self.status.as_str(), "running" | "queued" | "blocked")
+        !self.native && matches!(self.status.as_str(), "running" | "queued" | "blocked")
     }
     fn total_tokens(&self) -> f64 {
         self.tokens
@@ -678,6 +693,12 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
             .apply_settings(app.data.preferences.extra.get("orchestration"));
     }
 
+    // Claude's own subagents join the jobs, under the Claude tab that started them.
+    let native = native_subagent_jobs(app);
+    if native.iter().any(|j| j.status == "running") {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(1000));
+    }
     // Fresh snapshot only when the core published a new one.
     let orchestrator = Arc::clone(&app.orchestrator);
     let state = app.boards.entry(pane_id.to_string()).or_default();
@@ -725,12 +746,13 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
         jobs: snapshot
             .jobs
             .iter()
+            .cloned()
+            .chain(native)
             .filter(|job| match (&job.planner_id, &project_cwd) {
                 (Some(planner), _) => project_tabs.contains(planner),
                 (None, Some(cwd)) => job.cwd.starts_with(cwd.as_str()),
                 (None, None) => true,
             })
-            .cloned()
             .collect(),
         planners: snapshot
             .planners
@@ -743,7 +765,18 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
         concurrency_limit: snapshot.concurrency_limit,
     };
     let header = Rect::from_min_size(rect.min, vec2(rect.width(), HEADER_H));
-    let groups = group_planners(&snapshot);
+    let mut groups = group_planners(&snapshot);
+    // A Claude tab that only has subagents is no declared planner: name it like its tab.
+    for group in &mut groups {
+        if let Some(id) = &group.id {
+            if group.label.as_deref() == Some(id.as_str()) {
+                if let Some(tab) = app.find_tab(id) {
+                    group.label = Some(app.tab_title(tab));
+                    group.agent = Some(tab.agent.clone());
+                }
+            }
+        }
+    }
 
     let mut close = false;
     header_ui(app, ui, header, &snapshot, &groups, &mut close);
@@ -957,6 +990,9 @@ pub fn pane(app: &mut AletheApp, ui: &mut egui::Ui, pane_id: &str, rect: Rect, f
                 }
                 state.selected = id;
             }
+            // Native subagents are only shown; the core doesn't know them.
+            Intent::Answer(job, _) | Intent::Stop(job) | Intent::Restart(job)
+                if job.starts_with("subagent:") => {}
             Intent::Answer(job, decision) => orchestrator.answer(job, decision),
             Intent::Stop(job) => orchestrator.cancel(job),
             Intent::Restart(job) => orchestrator.restart(job),
@@ -1643,7 +1679,7 @@ fn worker_node(
     painter.text(
         pos2(icon.right() + 16.0 * s, icon.center().y),
         Align2::LEFT_CENTER,
-        &job.id,
+        job.label(),
         bold(11.5 * s),
         fade(theme.fg),
     );
@@ -2081,7 +2117,7 @@ fn rail_ui(
                             "",
                             lane,
                             Some(&job.agent),
-                            &job.id,
+                            &job.label(),
                             "",
                             &value,
                             selected,
@@ -2273,7 +2309,7 @@ fn inspector_ui(
     pui.horizontal(|ui| {
         let (r, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
         agent_glyph(ui, theme, Some(&job.agent), r);
-        ui.label(RichText::new(&job.id).font(bold(13.0)).color(theme.fg));
+        ui.label(RichText::new(job.label()).font(bold(13.0)).color(theme.fg));
         let lane = job.lane();
         ui.label(
             RichText::new(t(&format!("orchestrator.status.{}", job.status)))

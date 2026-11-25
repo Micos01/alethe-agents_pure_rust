@@ -64,7 +64,7 @@ Medido no Windows 11 (build release, só o processo do app, sem contar shells/ag
 Voz, plugins, catálogo de skills do Alethe, panes de navegador/arquivo/imagem/vídeo/diff, sincronização na nuvem e acesso
 remoto. Panes desses tipos aparecem com um aviso, e os dados deles são mantidos.
 
-No orquestrador ainda faltam os shells abertos pelo planner e as arestas animadas; no Markdown, diagramas Mermaid
+No orquestrador ainda faltam os shells abertos pelo planner e as arestas animadas (os subagentes nativos do Claude já aparecem no quadro); no Markdown, diagramas Mermaid
 (aparecem como código) e links clicáveis.
 
 ## Licença
