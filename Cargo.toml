@@ -1,0 +1,47 @@
+[package]
+name = "alethe-native"
+version = "0.1.0"
+description = "Alethe — multi-agent coding workspace, native Rust UI (no Tauri, no webview)"
+license = "AGPL-3.0-or-later"
+edition = "2021"
+
+[[bin]]
+name = "alethe-native"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+egui = "0.37"
+egui_extras = { version = "0.37", features = ["image", "svg"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+alacritty_terminal = "0.26"
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+which = "6"
+rfd = "0.15"
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+nanoid = "0.4"
+uuid = { version = "1", features = ["v4"] }
+dirs-next = "2"
+arboard = { version = "3", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
