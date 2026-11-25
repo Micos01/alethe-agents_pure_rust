@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use super::icons;
 use super::widgets::{self, mono, sans};
 use crate::app::AletheApp;
-use crate::backend::skills::{self, SkillAgentSnapshot, SkillDetail, SkillSummary};
+use crate::backend::skills::{
+    self, BundledSkillAgent, BundledSkillEntry, SkillAgentSnapshot, SkillDetail, SkillSummary,
+};
 use egui::{Align, Align2, CornerRadius, Layout, Margin, Pos2, Rect, RichText, Sense, Vec2};
 
 type Pending = Arc<Mutex<Option<Vec<SkillAgentSnapshot>>>>;
@@ -27,6 +29,266 @@ pub struct SkillsState {
     /// Asked once before deleting: the agent whose copy would go.
     confirm_remove: Option<String>,
     message: Option<(String, bool)>,
+    /// Alethe's own skills (`OfficialSkills`), for the folder they go to: None = global.
+    catalog: Option<(Option<String>, Vec<BundledSkillEntry>)>,
+    catalog_in_project: bool,
+    catalog_message: Option<(String, bool)>,
+}
+
+/// `pendingBundledAgents`: agents without Alethe's current copy.
+fn pending_agents(skill: &BundledSkillEntry) -> Vec<String> {
+    skill
+        .agents
+        .iter()
+        .filter(|a| a.state == "available" || a.state == "update")
+        .map(|a| a.agent.clone())
+        .collect()
+}
+
+/// `installedBundledAgents`: agents holding Alethe's copy, current or outdated.
+fn installed_agents(skill: &BundledSkillEntry) -> Vec<String> {
+    skill
+        .agents
+        .iter()
+        .filter(|a| a.state == "installed" || a.state == "update")
+        .map(|a| a.agent.clone())
+        .collect()
+}
+
+enum CatalogAction {
+    Install(String, Vec<String>),
+    Remove(String, Vec<String>),
+}
+
+/// The official skills card: install into every agent's global folder or into this project's,
+/// where they travel with the repository.
+fn catalog_section(
+    ui: &mut egui::Ui,
+    theme: &crate::theme::Theme,
+    lang: crate::i18n::Lang,
+    state: &mut SkillsState,
+    repo: Option<&str>,
+) {
+    let t = |key: &str| crate::i18n::tr(lang, key);
+    if repo.is_none() {
+        state.catalog_in_project = false;
+    }
+    let target = state
+        .catalog_in_project
+        .then(|| repo.map(str::to_string))
+        .flatten();
+    if state.catalog.as_ref().is_none_or(|(at, _)| *at != target) {
+        let entries = skills::skills_catalog(target.clone()).unwrap_or_default();
+        state.catalog = Some((target.clone(), entries));
+    }
+    let mut action: Option<CatalogAction> = None;
+    let mut switch: Option<bool> = None;
+    egui::Frame::new()
+        .fill(theme.panel)
+        .stroke(egui::Stroke::new(1.0, theme.border))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(t("skills.officialTitle"))
+                        .font(widgets::bold(12.5))
+                        .color(theme.fg),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    for (project, key) in [(true, "mcp.scopeProject"), (false, "mcp.scopeGlobal")] {
+                        let on = state.catalog_in_project == project;
+                        if ui
+                            .add_enabled(
+                                !project || repo.is_some(),
+                                egui::Button::selectable(
+                                    on,
+                                    RichText::new(t(key)).font(sans(11.0)),
+                                ),
+                            )
+                            .clicked()
+                            && !on
+                        {
+                            switch = Some(project);
+                        }
+                    }
+                });
+            });
+            ui.label(
+                RichText::new(t(if target.is_some() {
+                    "skills.projectDescription"
+                } else {
+                    "skills.globalDescription"
+                }))
+                .font(sans(11.0))
+                .color(theme.fg_faint),
+            );
+            let Some((_, entries)) = &state.catalog else {
+                return;
+            };
+            for skill in entries {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(&skill.name)
+                            .font(widgets::bold(12.5))
+                            .color(theme.fg),
+                    );
+                    ui.label(
+                        RichText::new(format!("v{}", skill.version))
+                            .font(mono(10.5))
+                            .color(theme.fg_faint),
+                    );
+                    if !skill.repository.is_empty() {
+                        ui.hyperlink_to(
+                            RichText::new(t("skills.sourceAction")).font(sans(11.0)),
+                            &skill.repository,
+                        );
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let installed = installed_agents(skill);
+                        if !installed.is_empty()
+                            && ui
+                                .button(
+                                    RichText::new(t("skills.removeAction"))
+                                        .font(sans(11.0))
+                                        .color(theme.offline),
+                                )
+                                .clicked()
+                        {
+                            action = Some(CatalogAction::Remove(skill.name.clone(), installed));
+                        }
+                        let pending = pending_agents(skill);
+                        if !pending.is_empty() {
+                            let update = skill.agents.iter().any(|a| a.state == "update");
+                            if ui
+                                .button(
+                                    RichText::new(t(if update {
+                                        "skills.updateAction"
+                                    } else {
+                                        "skills.installAction"
+                                    }))
+                                    .font(sans(11.0)),
+                                )
+                                .clicked()
+                            {
+                                action = Some(CatalogAction::Install(skill.name.clone(), pending));
+                            }
+                        }
+                    });
+                });
+                if !skill.description.is_empty() {
+                    let short = match skill.description.char_indices().nth(180) {
+                        Some((cut, _)) => format!("{}…", skill.description[..cut].trim_end()),
+                        None => skill.description.clone(),
+                    };
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(short).font(sans(11.5)).color(theme.fg_muted),
+                        )
+                        .wrap(),
+                    )
+                    .on_hover_text(&skill.description);
+                }
+                for entry in &skill.agents {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(agent_label(&entry.agent))
+                                .font(sans(11.5))
+                                .color(theme.fg),
+                        );
+                        let color = match entry.state.as_str() {
+                            "installed" => theme.working,
+                            "update" => theme.waiting,
+                            "conflict" => theme.offline,
+                            _ => theme.fg_faint,
+                        };
+                        ui.label(
+                            RichText::new(t(&format!("skills.state.{}", entry.state)))
+                                .font(mono(10.5))
+                                .color(color),
+                        )
+                        .on_hover_text(entry.path.clone().unwrap_or_default());
+                    });
+                }
+                if skill.agents.iter().any(|a| a.state == "conflict") {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(t("skills.conflictNote"))
+                                .font(sans(11.0))
+                                .color(theme.fg_faint),
+                        )
+                        .wrap(),
+                    );
+                }
+            }
+            if let Some((text, failed)) = &state.catalog_message {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(RichText::new(text).font(sans(11.5)).color(if *failed {
+                        theme.offline
+                    } else {
+                        theme.working
+                    }))
+                    .wrap(),
+                );
+            }
+        });
+    if let Some(project) = switch {
+        state.catalog_in_project = project;
+        state.catalog_message = None;
+    }
+    let Some(action) = action else {
+        return;
+    };
+    let failed = |report: &[BundledSkillAgent], ok: &dyn Fn(&BundledSkillAgent) -> bool| {
+        report
+            .iter()
+            .filter(|e| !ok(e))
+            .map(|e| {
+                format!(
+                    "{}: {}",
+                    agent_label(&e.agent),
+                    e.error
+                        .clone()
+                        .unwrap_or_else(|| t("skills.conflictNote").into())
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    state.catalog_message = Some(match action {
+        CatalogAction::Install(name, agents) => {
+            match skills::skills_install_bundled(name.clone(), agents, target.clone()) {
+                Ok(report) => {
+                    let errors = failed(&report, &|e| e.state == "installed");
+                    if errors.is_empty() {
+                        (t("skills.installed").replace("{name}", &name), false)
+                    } else {
+                        (errors.join("\n"), true)
+                    }
+                }
+                Err(error) => (error, true),
+            }
+        }
+        CatalogAction::Remove(name, agents) => {
+            match skills::skills_remove_bundled(name.clone(), agents, target.clone()) {
+                Ok(report) => {
+                    let errors =
+                        failed(&report, &|e| e.state != "installed" && e.state != "update");
+                    if errors.is_empty() {
+                        (t("skills.removedOfficial").replace("{name}", &name), false)
+                    } else {
+                        (errors.join("\n"), true)
+                    }
+                }
+                Err(error) => (error, true),
+            }
+        }
+    });
+    // Reload the states, and the installed list the install just changed.
+    state.catalog = None;
+    state.loaded = false;
 }
 
 struct SkillGroup {
@@ -71,6 +333,7 @@ impl SkillsState {
 
     pub fn refresh(&mut self, ctx: &egui::Context) {
         self.open = None;
+        self.catalog = None;
         self.rescan(ctx);
     }
 }
@@ -99,7 +362,7 @@ fn groups(snapshots: &[SkillAgentSnapshot]) -> Vec<SkillGroup> {
         .collect()
 }
 
-pub fn view(app: &mut AletheApp, ui: &mut egui::Ui) {
+pub fn view(app: &mut AletheApp, ui: &mut egui::Ui, repo: Option<String>) {
     let theme = app.theme.clone();
     let lang = app.lang();
     let t = |key: &str| crate::i18n::tr(lang, key);
@@ -148,6 +411,10 @@ pub fn view(app: &mut AletheApp, ui: &mut egui::Ui) {
             egui::Frame::new()
                 .inner_margin(Margin::symmetric(8, 4))
                 .show(ui, |ui| {
+                    if query.is_empty() {
+                        catalog_section(ui, &theme, lang, state, repo.as_deref());
+                        ui.add_space(8.0);
+                    }
                     if visible.is_empty() && state.loaded {
                         ui.add_space(30.0);
                         ui.vertical_centered(|ui| {

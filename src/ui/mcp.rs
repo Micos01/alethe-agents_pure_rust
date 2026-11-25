@@ -330,7 +330,8 @@ pub fn panel(app: &mut AletheApp, ui: &mut egui::Ui) {
         app.mcp_panel.rescan(ui.ctx());
     }
     if app.mcp_panel.show_skills {
-        super::skills::view(app, ui);
+        let repo = app.mcp_panel.repo.clone();
+        super::skills::view(app, ui, repo);
         return;
     }
 
