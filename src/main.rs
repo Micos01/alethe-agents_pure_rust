@@ -76,6 +76,19 @@ fn install_fonts(ctx: &egui::Context) {
         .entry(egui::FontFamily::Monospace)
         .or_default();
     mono.insert(0, "caskaydia".into());
+    // The Nerd font lacks the dingbats and technical symbols CLIs draw (Claude Code's spinner
+    // ✽✻✶✢, the tool-result ⎿, ✗ ✘ ⧉): fall back to the system's symbol font before egui's own.
+    // Read from disk rather than embedded, so the binary does not grow.
+    if let Some(bytes) = load_system_font(&[
+        "C:\\Windows\\Fonts\\seguisym.ttf",
+        "/System/Library/Fonts/Apple Symbols.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]) {
+        fonts
+            .font_data
+            .insert("symbols".into(), Arc::new(egui::FontData::from_owned(bytes)));
+        mono.insert(1, "symbols".into());
+    }
 
     let mut bold_family = vec!["caskaydia-bold".to_string()];
     bold_family.extend(
