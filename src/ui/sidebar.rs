@@ -44,8 +44,19 @@ pub fn show(app: &mut AletheApp, ui: &mut egui::Ui) {
                         app.act(Action::OpenProject(id));
                     }
                 }
-                ui.add_enabled_ui(false, |ui| {
-                    icon_button(ui, &theme, icons::FOLDER, "", 30.0);
+                // Files: no tree of our own; nvim in a pane is the file browser and editor.
+                let files_project = app
+                    .active_project_id()
+                    .map(str::to_string)
+                    .or_else(|| app.data.workspace.recent_project_ids.first().cloned());
+                ui.add_enabled_ui(files_project.is_some(), |ui| {
+                    if icon_button(ui, &theme, icons::FOLDER, app.t("sidebar.files"), 30.0)
+                        .clicked()
+                    {
+                        if let Some(id) = files_project {
+                            app.act(Action::OpenFiles(id));
+                        }
+                    }
                 });
                 // Source Control: like the web build's contributed `git` tab, it leaves Home.
                 let git_label = crate::ui::git_panel::tab_label(lang);

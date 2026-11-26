@@ -384,6 +384,7 @@ messages! {
     "sidebar.newOrchestration" => "Nova orquestração", "New orchestration";
     "sidebar.openMarkdown" => "Abrir arquivo Markdown…", "Open Markdown file…";
     "sidebar.openImage" => "Abrir imagem…", "Open image…";
+    "sidebar.files" => "Arquivos (abre o nvim na pasta do projeto)", "Files (opens nvim in the project folder)";
     "image.filter" => "Imagens", "Images";
     "image.fit" => "ajustar", "fit";
     "image.fitHint" => "Alterna entre ajustar ao pane e o tamanho real (duplo clique ajusta)", "Toggles between fit to pane and actual size (double-click fits)";

@@ -168,6 +168,8 @@ pub enum Action {
     /// Asks for a `.md` file and opens it as a pane in the project.
     OpenMarkdown(String),
     OpenImage(String),
+    /// The sidebar's Files button: a shell pane in the project folder that starts `nvim .`.
+    OpenFiles(String),
     Toast(String),
 }
 
@@ -1743,6 +1745,18 @@ impl AletheApp {
                         name,
                         Some(path.to_string_lossy().to_string()),
                     );
+                }
+            }
+            Action::OpenFiles(project_id) => {
+                // Typed into a shell rather than launched directly: quitting nvim leaves a shell in
+                // the folder instead of a dead pane, and `nvim` resolves through the user's PATH.
+                self.add_terminal(&project_id, "shell", None, Vec::new(), Some("nvim .".into()));
+                if let Some(id) = self.focused_terminal.clone() {
+                    if let Some((project, index)) = self.find_terminal_mut(&id) {
+                        let terminal = &mut project.terminals[index];
+                        terminal.name = "nvim".into();
+                        terminal.custom_name = Some(true);
+                    }
                 }
             }
             Action::OpenImage(project_id) => {
